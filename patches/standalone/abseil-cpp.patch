@@ -1,0 +1,165 @@
+diff --git a/absl/base/config.h b/absl/base/config.h
+index 5fa9f0e..84197a2 100644
+--- a/absl/base/config.h
++++ b/absl/base/config.h
+@@ -492,6 +492,8 @@ static_assert(ABSL_INTERNAL_INLINE_NAMESPACE_STR[0] != 'h' ||
+ // WASI doesn't support signals
+ #elif defined(__Fuchsia__)
+ // Signals don't exist on fuchsia.
++#elif defined(__AROS__)
++// alarm(2) is not implemented by AROS posixc.
+ #elif defined(__native_client__)
+ // Signals don't exist on hexagon/QuRT
+ #elif defined(__hexagon__)
+diff --git a/absl/base/internal/low_level_alloc.cc b/absl/base/internal/low_level_alloc.cc
+index a563f7b..4be33c7 100644
+--- a/absl/base/internal/low_level_alloc.cc
++++ b/absl/base/internal/low_level_alloc.cc
+@@ -33,7 +33,15 @@
+ // LowLevelAlloc.
+ #ifndef ABSL_LOW_LEVEL_ALLOC_MISSING
+ 
+-#ifndef _WIN32
++#if defined(__AROS__)
++#pragma push_macro("SCHED_RR")
++#undef SCHED_RR
++#include <aros/kernel.h>
++#pragma pop_macro("SCHED_RR")
++#include <exec/memory.h>
++#include <proto/exec.h>
++#include <proto/kernel.h>
++#elif !defined(_WIN32)
+ #include <pthread.h>
+ #include <signal.h>
+ #include <sys/mman.h>
+@@ -329,6 +337,9 @@ size_t GetPageSize() {
+   SYSTEM_INFO system_info;
+   GetSystemInfo(&system_info);
+   return std::max(system_info.dwPageSize, system_info.dwAllocationGranularity);
++#elif defined(__AROS__)
++  // The current native x86-64 AROS MMU contract uses 4 KiB pages.
++  return 4096;
+ #elif defined(__wasm__) || defined(__asmjs__) || defined(__hexagon__)
+   return getpagesize();
+ #else
+@@ -406,6 +417,12 @@ bool LowLevelAlloc::DeleteArena(Arena *arena) {
+     munmap_result = VirtualFree(region, 0, MEM_RELEASE);
+     ABSL_RAW_CHECK(munmap_result != 0,
+                    "LowLevelAlloc::DeleteArena: VitualFree failed");
++#elif defined(__AROS__)
++    APTR KernelBase = OpenResource("kernel.resource");
++    ABSL_RAW_CHECK(KernelBase != nullptr,
++                   "LowLevelAlloc::DeleteArena: kernel.resource missing");
++    KrnFreePages(region, size);
++    munmap_result = 0;
+ #else
+ #ifndef ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING
+     if ((arena->flags & LowLevelAlloc::kAsyncSignalSafe) == 0) {
+@@ -552,6 +569,13 @@ static void *DoAllocWithArena(size_t request, LowLevelAlloc::Arena *arena) {
+       new_pages = VirtualAlloc(nullptr, new_pages_size,
+                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+       ABSL_RAW_CHECK(new_pages != nullptr, "VirtualAlloc failed");
++#elif defined(__AROS__)
++      APTR KernelBase = OpenResource("kernel.resource");
++      ABSL_RAW_CHECK(KernelBase != nullptr,
++                     "LowLevelAlloc: kernel.resource missing");
++      new_pages = KrnAllocPages(nullptr, new_pages_size,
++                                MEMF_PUBLIC | MEMF_CLEAR);
++      ABSL_RAW_CHECK(new_pages != nullptr, "KrnAllocPages failed");
+ #else
+ #ifndef ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING
+       if ((arena->flags & LowLevelAlloc::kAsyncSignalSafe) != 0) {
+diff --git a/absl/base/internal/low_level_alloc.h b/absl/base/internal/low_level_alloc.h
+index c2f1f25..029630f 100644
+--- a/absl/base/internal/low_level_alloc.h
++++ b/absl/base/internal/low_level_alloc.h
+@@ -36,7 +36,7 @@
+ // LowLevelAlloc.
+ #ifdef ABSL_LOW_LEVEL_ALLOC_MISSING
+ #error ABSL_LOW_LEVEL_ALLOC_MISSING cannot be directly set
+-#elif !defined(ABSL_HAVE_MMAP) && !defined(_WIN32)
++#elif !defined(ABSL_HAVE_MMAP) && !defined(_WIN32) && !defined(__AROS__)
+ #define ABSL_LOW_LEVEL_ALLOC_MISSING 1
+ #endif
+ 
+@@ -46,8 +46,8 @@
+ // for more information.
+ #ifdef ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING
+ #error ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING cannot be directly set
+-#elif defined(_WIN32) || defined(__asmjs__) || defined(__wasm__) || \
+-    defined(__hexagon__)
++#elif defined(_WIN32) || defined(__AROS__) || defined(__asmjs__) || \
++    defined(__wasm__) || defined(__hexagon__)
+ #define ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING 1
+ #endif
+ 
+diff --git a/absl/base/internal/thread_identity.cc b/absl/base/internal/thread_identity.cc
+index 0471a25..8b45056 100644
+--- a/absl/base/internal/thread_identity.cc
++++ b/absl/base/internal/thread_identity.cc
+@@ -99,6 +99,11 @@ void SetCurrentThreadIdentity(ThreadIdentity* identity,
+   //
+   // While not officially async-signal safe, getspecific within a signal handler
+   // is otherwise OK.
++#if defined(__AROS__)
++  // AROS has no POSIX signals to mask; its pthread keys are plain storage.
++  pthread_setspecific(thread_identity_pthread_key,
++                      reinterpret_cast<void*>(identity));
++#else
+   sigset_t all_signals;
+   sigset_t curr_signals;
+   sigfillset(&all_signals);
+@@ -106,6 +111,7 @@ void SetCurrentThreadIdentity(ThreadIdentity* identity,
+   pthread_setspecific(thread_identity_pthread_key,
+                       reinterpret_cast<void*>(identity));
+   pthread_sigmask(SIG_SETMASK, &curr_signals, nullptr);
++#endif  // __AROS__
+ #endif  // !__EMSCRIPTEN__ && !__MINGW32__
+ 
+ #elif ABSL_THREAD_IDENTITY_MODE == ABSL_THREAD_IDENTITY_MODE_USE_TLS
+diff --git a/absl/base/internal/thread_identity.h b/absl/base/internal/thread_identity.h
+index b6e917c..9af7786 100644
+--- a/absl/base/internal/thread_identity.h
++++ b/absl/base/internal/thread_identity.h
+@@ -144,7 +144,14 @@ struct ThreadIdentity {
+ 
+   // Private: Reserved for absl::synchronization_internal::Waiter.
+   struct WaiterState {
++#if defined(__AROS__)
++    // AROS pthread mutexes and condition variables embed Exec synchronization
++    // state, making PthreadWaiter larger than Abseil's usual inline reserve.
++    // Keep the size mismatch compile-time checked by WaiterCrtp.
++    alignas(void*) char data[2048];
++#else
+     alignas(void*) char data[256];
++#endif
+   } waiter_state;
+ 
+   // Used by PerThreadSem::{Get,Set}ThreadBlockedCounter().
+diff --git a/absl/debugging/failure_signal_handler.cc b/absl/debugging/failure_signal_handler.cc
+index 570d1e5..33f6d68 100644
+--- a/absl/debugging/failure_signal_handler.cc
++++ b/absl/debugging/failure_signal_handler.cc
+@@ -60,7 +60,8 @@
+ // Apple macOS has sigaltstack, but using it makes backtrace() unusable.
+ #if !(defined(TARGET_OS_OSX) && TARGET_OS_OSX) &&     \
+     !(defined(TARGET_OS_WATCH) && TARGET_OS_WATCH) && \
+-    !(defined(TARGET_OS_TV) && TARGET_OS_TV) && !defined(__QNX__)
++    !(defined(TARGET_OS_TV) && TARGET_OS_TV) && !defined(__QNX__) && \
++    !defined(__AROS__)
+ #define ABSL_HAVE_SIGALTSTACK
+ #endif
+ #endif
+diff --git a/absl/debugging/internal/elf_mem_image.h b/absl/debugging/internal/elf_mem_image.h
+index e7fe6ab..d13088a 100644
+--- a/absl/debugging/internal/elf_mem_image.h
++++ b/absl/debugging/internal/elf_mem_image.h
+@@ -34,7 +34,7 @@
+ #if defined(__ELF__) && !defined(__OpenBSD__) && !defined(__QNX__) && \
+     !defined(__native_client__) && !defined(__asmjs__) &&             \
+     !defined(__wasm__) && !defined(__HAIKU__) && !defined(__sun) &&   \
+-    !defined(__VXWORKS__) && !defined(__hexagon__)
++    !defined(__VXWORKS__) && !defined(__hexagon__) && !defined(__AROS__)
+ #define ABSL_HAVE_ELF_MEM_IMAGE 1
+ #endif
+ 

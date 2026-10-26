@@ -1,0 +1,48 @@
+From d41ac5515b6ed158dded77b3d52474f8dea409bf Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 16:52:44 +0200
+Subject: [PATCH] lzma_sdk: CPU features from the kernel on AROS
+
+AROS has no <sys/auxv.h>; the kernel serves the AArch64 feature words
+through KrnGetSystemAttr(KATTR_HWCap), in the Linux AT_HWCAP layout, so
+the checks map one to one (NEON, CRC32, SHA1, SHA2, AES).
+---
+ third_party/lzma_sdk/C/CpuArch.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/third_party/lzma_sdk/C/CpuArch.c b/third_party/lzma_sdk/C/CpuArch.c
+index 30451fba9b..414414cb38 100644
+--- a/third_party/lzma_sdk/C/CpuArch.c
++++ b/third_party/lzma_sdk/C/CpuArch.c
+@@ -413,6 +413,31 @@ BoolInt CPU_IsSupported_SHA2(void) { return APPLE_CRYPTO_SUPPORT_VAL; }
+ BoolInt CPU_IsSupported_AES (void) { return APPLE_CRYPTO_SUPPORT_VAL; }
+ 
+ 
++#elif defined(__AROS__)
++
++// AArch64 AROS: the kernel decodes the ID registers once and serves the
++// feature words through KrnGetSystemAttr(), in the Linux AT_HWCAP layout.
++#include <aros/aarch64/hwcap.h>
++#include <proto/exec.h>
++#include <proto/kernel.h>
++
++static unsigned long My_aros_hwcap(void)
++{
++  APTR kernel = OpenResource((CONST_STRPTR) "kernel.resource");
++  intptr_t caps = kernel ? __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap, kernel) : -1;
++  return caps == -1 ? 0 : (unsigned long)caps;
++}
++
++  #define MY_HWCAP_CHECK_FUNC_2(name1, name2) \
++  BoolInt CPU_IsSupported_ ## name1(void) { return (My_aros_hwcap() & (AROS_HWCAP_ ## name2)) ? 1 : 0; }
++  #define MY_HWCAP_CHECK_FUNC(name) \
++  MY_HWCAP_CHECK_FUNC_2(name, name)
++  MY_HWCAP_CHECK_FUNC_2(NEON, ASIMD)
++  MY_HWCAP_CHECK_FUNC (CRC32)
++  MY_HWCAP_CHECK_FUNC (SHA1)
++  MY_HWCAP_CHECK_FUNC (SHA2)
++  MY_HWCAP_CHECK_FUNC (AES)
++
+ #else // __APPLE__
+ 
+ #include <sys/auxv.h>

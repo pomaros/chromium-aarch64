@@ -1,0 +1,92 @@
+From e4b9264c6c23cec65f796030cd00edd444769819 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 10:10:51 +0200
+Subject: [PATCH 696/696] aros: build base against the AROS SDK on AArch64
+
+- BoringSSL: define OPENSSL_NO_SOCK on AArch64 AROS. The AROS master SDK
+  declares no POSIX socket functions (sockets go through bsdsocket.library's
+  <proto/socket.h>), and Chromium's network stack does not use BoringSSL's
+  socket BIOs.
+- base: no thread pinning on AArch64. Native AArch64 AROS runs a task on
+  another core only while it touches memory alone, without Exec calls, and
+  its pthread has no affinity attribute; both pinning switches are opt-in
+  and become no-ops there.
+
+x64 is unchanged.
+
+Tested: //base (with abseil, BoringSSL, perfetto, PartitionAlloc and the
+allocator shim) compiles and archives for aarch64-unknown-aros with clang
+20, together with src 0690-0695.
+---
+ base/threading/platform_thread_aros.cc | 16 ++++++++++++++++
+ third_party/boringssl/BUILD.gn         |  9 ++++++++-
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/base/threading/platform_thread_aros.cc b/base/threading/platform_thread_aros.cc
+index de9bb98d20..00b7187301 100644
+--- a/base/threading/platform_thread_aros.cc
++++ b/base/threading/platform_thread_aros.cc
+@@ -142,6 +142,13 @@ bool ArosPlacingCodecThreads() {
+ }
+ 
+ void MaybePinForeignThread(pthread_attr_t* attributes) {
++#if !defined(__x86_64__)
++  // Native AArch64 AROS runs a task on another core only while it touches
++  // memory alone (no Exec calls), and its pthread has no affinity attribute:
++  // no pinning there.
++  (void)attributes;
++  return;
++#else
+   if (PinCodecThreadsEnabled() < 0)
+     return;
+   APTR KernelBase = OpenResource("kernel.resource");
+@@ -164,9 +171,17 @@ void MaybePinForeignThread(pthread_attr_t* attributes) {
+                 "[Chromium:SMP] pin foreign thread slot=%u cpu=%d of %d\n", slot,
+                 cpu, cpus);
+   ArosKPutStr(line);
++#endif
+ }
+ 
+ void MaybePinThreadRoundRobin(pthread_attr_t* attributes) {
++#if !defined(__x86_64__)
++  // Native AArch64 AROS runs a task on another core only while it touches
++  // memory alone (no Exec calls), and its pthread has no affinity attribute:
++  // no pinning there.
++  (void)attributes;
++  return;
++#else
+   const int cap = PinWorkersCpuCap();
+   if (cap < 0)
+     return;
+@@ -203,6 +218,7 @@ void MaybePinThreadRoundRobin(pthread_attr_t* attributes) {
+   std::snprintf(line, sizeof(line), "[Chromium:SMP] pin thread slot=%u cpu=%d of %d\n",
+                 slot, cpu, cpus);
+   ArosKPutStr(line);
++#endif
+ }
+ 
+ int ArosCurrentCpu() {
+diff --git a/third_party/boringssl/BUILD.gn b/third_party/boringssl/BUILD.gn
+index d8e2f7cf82..010d22dd46 100644
+--- a/third_party/boringssl/BUILD.gn
++++ b/third_party/boringssl/BUILD.gn
+@@ -19,8 +19,15 @@ if (enable_rust) {
+ # Config for us and everybody else depending on BoringSSL.
+ config("external_config") {
+   include_dirs = [ "src/include" ]
++  defines = []
+   if (is_component_build) {
+-    defines = [ "BORINGSSL_SHARED_LIBRARY" ]
++    defines += [ "BORINGSSL_SHARED_LIBRARY" ]
++  }
++  if (is_aros && current_cpu == "arm64") {
++    # The AROS master SDK declares no POSIX socket functions (sockets go
++    # through bsdsocket.library's <proto/socket.h>), and Chromium's network
++    # stack does not use BoringSSL's socket BIOs.
++    defines += [ "OPENSSL_NO_SOCK" ]
+   }
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

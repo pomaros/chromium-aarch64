@@ -1,0 +1,47 @@
+From 1e15a4dba49e22d9ef02718e88c1147c1c40ded4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 18:17:24 +0200
+Subject: [PATCH] AROS: constinit on the extern thread_local
+
+Without it, every use from another translation unit calls the TLS init
+function through a weak reference, which clang addresses through the GOT
+with -mcmodel=large -fno-pic; the AROS loader has no GOT. The variables
+are constant-initialised already.
+---
+ util/trace_logging/scoped_trace_operations.cc | 4 ++--
+ util/trace_logging/scoped_trace_operations.h  | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/util/trace_logging/scoped_trace_operations.cc b/util/trace_logging/scoped_trace_operations.cc
+index 53b3fa0..ce5e43f 100644
+--- a/util/trace_logging/scoped_trace_operations.cc
++++ b/util/trace_logging/scoped_trace_operations.cc
+@@ -74,11 +74,11 @@ ScopedTraceOperation::~ScopedTraceOperation() {
+ }
+ 
+ // static
+-thread_local ScopedTraceOperation::TraceStack* ScopedTraceOperation::traces_ =
++constinit thread_local ScopedTraceOperation::TraceStack* ScopedTraceOperation::traces_ =
+     nullptr;
+ 
+ // static
+-thread_local ScopedTraceOperation* ScopedTraceOperation::root_node_ = nullptr;
++constinit thread_local ScopedTraceOperation* ScopedTraceOperation::root_node_ = nullptr;
+ 
+ // static
+ std::atomic<std::uint64_t> ScopedTraceOperation::trace_id_counter_{
+diff --git a/util/trace_logging/scoped_trace_operations.h b/util/trace_logging/scoped_trace_operations.h
+index 22badf3..639c1da 100644
+--- a/util/trace_logging/scoped_trace_operations.h
++++ b/util/trace_logging/scoped_trace_operations.h
+@@ -101,8 +101,8 @@ class ScopedTraceOperation {
+ 
+   // The LIFO stack of TraceLoggers currently being watched by this
+   // thread.
+-  static thread_local TraceStack* traces_;
+-  static thread_local ScopedTraceOperation* root_node_;
++  static constinit thread_local TraceStack* traces_;
++  static constinit thread_local ScopedTraceOperation* root_node_;
+ 
+   OSP_DISALLOW_COPY_AND_ASSIGN(ScopedTraceOperation);
+ };

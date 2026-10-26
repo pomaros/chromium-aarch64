@@ -1,0 +1,340 @@
+From 1de956961ea5cff4b29ced16de5001ecc759ac82 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 03:59:43 +0200
+Subject: [PATCH 693/696] build: generate AArch64 import trampolines for the
+ shared engine libraries
+
+v8.library and blink_platform.library are reached through generated
+trampolines whose first call resolves the mangled symbol and caches it in a
+writable slot. The generators emitted x86-64 assembly only. Add an AArch64
+emitter, shared by both generators and selected by GN's current_cpu:
+
+- each import loads its slot address with the large-model MOVZ/MOVK
+  relocations (code and data hunks are placed independently) and branches
+  through it;
+- the slot starts at the import's slow entry, which puts the import index
+  in x17 and enters the slow path;
+- the slow path preserves x0-x7, the indirect-result register x8 and
+  q0-q7, calls the resolver and tail-branches to the target through x16,
+  so stack arguments and variadic calls pass unchanged.
+
+The x64 output of both generators is byte-identical to before.
+
+Tested: both manifests assemble for aarch64-unknown-aros (relocations
+ABS64, MOVW_UABS_G0-G3, JUMP26, CALL26, all accepted by the AROS loader);
+a probe that routes four imports through the emitted trampolines (ten
+integer arguments, ten floating-point and integer arguments, a 32-byte
+struct returned through x8, a variadic call), each called twice, passes on
+AArch64 AROS in QEMU and resolves each import exactly once.
+---
+ .../aros/blink_platform_library/BUILD.gn      |   7 +-
+ .../generate_blink_platform_imports.py        |  22 ++-
+ build/config/aros/import_trampolines_arm64.py | 148 ++++++++++++++++++
+ build/config/aros/v8_library/BUILD.gn         |   7 +-
+ .../aros/v8_library/generate_v8_imports.py    |  22 ++-
+ 5 files changed, 200 insertions(+), 6 deletions(-)
+ create mode 100644 build/config/aros/import_trampolines_arm64.py
+
+diff --git a/build/config/aros/blink_platform_library/BUILD.gn b/build/config/aros/blink_platform_library/BUILD.gn
+index 925ad802e5..44b55ab67b 100644
+--- a/build/config/aros/blink_platform_library/BUILD.gn
++++ b/build/config/aros/blink_platform_library/BUILD.gn
+@@ -9,7 +9,10 @@ _generated_imports = "$target_gen_dir/blink_platform_library_imports.S"
+ action("generate_blink_platform_library_imports") {
+   script = "generate_blink_platform_imports.py"
+ 
+-  inputs = [ "blink_platform_function_imports.txt" ]
++  inputs = [
++    "blink_platform_function_imports.txt",
++    "../import_trampolines_arm64.py",
++  ]
+   outputs = [ _generated_imports ]
+ 
+   args = [
+@@ -17,6 +20,8 @@ action("generate_blink_platform_library_imports") {
+     rebase_path(inputs[0], root_build_dir),
+     "--output",
+     rebase_path(outputs[0], root_build_dir),
++    "--cpu",
++    current_cpu,
+   ]
+ }
+ 
+diff --git a/build/config/aros/blink_platform_library/generate_blink_platform_imports.py b/build/config/aros/blink_platform_library/generate_blink_platform_imports.py
+index 700a16c945..64234bf2a8 100644
+--- a/build/config/aros/blink_platform_library/generate_blink_platform_imports.py
++++ b/build/config/aros/blink_platform_library/generate_blink_platform_imports.py
+@@ -3,11 +3,16 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
+-"""Generates x86-64 AROS import trampolines for blink_platform.library."""
++"""Generates AROS import trampolines for blink_platform.library (x86-64 or
++AArch64)."""
+ 
+ import argparse
+ import pathlib
+ import re
++import sys
++
++sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
++import import_trampolines_arm64  # noqa: E402
+ 
+ 
+ _SYMBOL_RE = re.compile(r"^[_A-Za-z][_A-Za-z0-9.$]*$")
+@@ -169,11 +174,24 @@ def main() -> None:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--manifest", required=True, type=pathlib.Path)
+     parser.add_argument("--output", required=True, type=pathlib.Path)
++    parser.add_argument("--cpu", choices=("x64", "arm64"), default="x64")
+     args = parser.parse_args()
+ 
+     symbols = _read_manifest(args.manifest)
++    if args.cpu == "arm64":
++        text = import_trampolines_arm64.emit(
++            generator="generate_blink_platform_imports.py",
++            symbols=symbols,
++            slow_path="ArosBlinkPlatformImportSlowPath",
++            resolver="ArosResolveBlinkPlatformImport",
++            slots="g_blink_platform_import_slots",
++            count="g_blink_platform_import_count",
++            names="g_blink_platform_import_names",
++        )
++    else:
++        text = _emit(symbols)
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+-    args.output.write_text(_emit(symbols), encoding="utf-8")
++    args.output.write_text(text, encoding="utf-8")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/build/config/aros/import_trampolines_arm64.py b/build/config/aros/import_trampolines_arm64.py
+new file mode 100644
+index 0000000000..279078069a
+--- /dev/null
++++ b/build/config/aros/import_trampolines_arm64.py
+@@ -0,0 +1,148 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++"""AArch64 AROS import trampolines for the shared engine libraries.
++
++Each import starts as a branch through a writable slot that initially points
++at the import's slow entry. The slow path preserves every AAPCS64 argument
++register (x0-x7, the indirect-result register x8, and q0-q7), asks the
++resolver for the target, caches it in the slot and tail-branches to it, so the
++first call behaves exactly like later ones. Addresses are materialised with
++the large-model MOVZ/MOVK relocations: the AROS loader places code and data
++hunks independently, so no PC-relative reach is assumed between them.
++"""
++
++
++def _absolute(register: str, symbol: str) -> list[str]:
++    return [
++        f"        movz {register}, #:abs_g3:{symbol}",
++        f"        movk {register}, #:abs_g2_nc:{symbol}",
++        f"        movk {register}, #:abs_g1_nc:{symbol}",
++        f"        movk {register}, #:abs_g0_nc:{symbol}",
++    ]
++
++
++def emit(
++    *,
++    generator: str,
++    symbols: list[str],
++    slow_path: str,
++    resolver: str,
++    slots: str,
++    count: str,
++    names: str,
++    data_imports: tuple[tuple[str, str], ...] = (),
++) -> str:
++    if len(symbols) > 0xFFFF:
++        raise ValueError("more imports than a MOVZ index can encode")
++
++    lines = [
++        f"// Generated by {generator}. Do not edit.",
++        "",
++        "        .text",
++        "        .p2align 4",
++        f"        .globl {slow_path}",
++        f"        .type {slow_path}, @function",
++        f"{slow_path}:",
++        "        // x17 holds the import index (set by the slow entry).",
++        "        stp x29, x30, [sp, #-224]!",
++        "        mov x29, sp",
++        "        stp x0, x1, [sp, #16]",
++        "        stp x2, x3, [sp, #32]",
++        "        stp x4, x5, [sp, #48]",
++        "        stp x6, x7, [sp, #64]",
++        "        str x8, [sp, #80]",
++        "        stp q0, q1, [sp, #96]",
++        "        stp q2, q3, [sp, #128]",
++        "        stp q4, q5, [sp, #160]",
++        "        stp q6, q7, [sp, #192]",
++        "        mov x0, x17",
++        f"        bl {resolver}",
++        "        mov x16, x0",
++        "        ldp q6, q7, [sp, #192]",
++        "        ldp q4, q5, [sp, #160]",
++        "        ldp q2, q3, [sp, #128]",
++        "        ldp q0, q1, [sp, #96]",
++        "        ldr x8, [sp, #80]",
++        "        ldp x6, x7, [sp, #64]",
++        "        ldp x4, x5, [sp, #48]",
++        "        ldp x2, x3, [sp, #32]",
++        "        ldp x0, x1, [sp, #16]",
++        "        ldp x29, x30, [sp], #224",
++        "        br x16",
++        f"        .size {slow_path}, .-{slow_path}",
++        "",
++    ]
++
++    for index, symbol in enumerate(symbols):
++        lines.extend(
++            [
++                "        .p2align 4",
++                f"        .globl {symbol}",
++                f"        .type {symbol}, @function",
++                f"{symbol}:",
++                *_absolute("x16", f"{slots}+{index * 8}"),
++                "        ldr x16, [x16]",
++                "        br x16",
++                f"        .size {symbol}, .-{symbol}",
++                f".Lslow_{index}:",
++                f"        movz x17, #{index}",
++                f"        b {slow_path}",
++                "",
++            ]
++        )
++
++    lines.extend(
++        [
++            "        .section .rodata",
++            "        .p2align 3",
++            f"        .globl {count}",
++            f"        .type {count}, @object",
++            f"{count}:",
++            f"        .quad {len(symbols)}",
++            f"        .size {count}, 8",
++            "",
++            f"        .globl {names}",
++            f"        .type {names}, @object",
++            f"{names}:",
++        ]
++    )
++    for index in range(len(symbols)):
++        lines.append(f"        .quad .Limport_name_{index}")
++    lines.append(f"        .size {names}, {len(symbols) * 8}")
++    lines.append("")
++    for index, symbol in enumerate(symbols):
++        lines.extend([f".Limport_name_{index}:", f'        .asciz "{symbol}"'])
++    for index, (_, value) in enumerate(data_imports):
++        lines.extend([f".Ldata_value_{index}:", f'        .asciz "{value}"'])
++
++    lines.extend(
++        [
++            "",
++            "        .data",
++            "        .p2align 3",
++            f"        .globl {slots}",
++            f"        .type {slots}, @object",
++            f"{slots}:",
++        ]
++    )
++    for index in range(len(symbols)):
++        lines.append(f"        .quad .Lslow_{index}")
++    lines.append(f"        .size {slots}, {len(symbols) * 8}")
++
++    for index, (symbol, _) in enumerate(data_imports):
++        lines.extend(
++            [
++                "",
++                "        .p2align 3",
++                f"        .globl {symbol}",
++                f"        .type {symbol}, @object",
++                f"{symbol}:",
++                f"        .quad .Ldata_value_{index}",
++                f"        .size {symbol}, 8",
++            ]
++        )
++
++    lines.extend(["", '        .section .note.GNU-stack,"",@progbits', ""])
++    return "\n".join(lines)
+diff --git a/build/config/aros/v8_library/BUILD.gn b/build/config/aros/v8_library/BUILD.gn
+index 7978b07ee7..6c12d93031 100644
+--- a/build/config/aros/v8_library/BUILD.gn
++++ b/build/config/aros/v8_library/BUILD.gn
+@@ -9,7 +9,10 @@ _generated_imports = "$target_gen_dir/v8_library_imports.S"
+ action("generate_v8_library_imports") {
+   script = "generate_v8_imports.py"
+ 
+-  inputs = [ "v8_function_imports.txt" ]
++  inputs = [
++    "v8_function_imports.txt",
++    "../import_trampolines_arm64.py",
++  ]
+   outputs = [ _generated_imports ]
+ 
+   args = [
+@@ -17,6 +20,8 @@ action("generate_v8_library_imports") {
+     rebase_path(inputs[0], root_build_dir),
+     "--output",
+     rebase_path(outputs[0], root_build_dir),
++    "--cpu",
++    current_cpu,
+   ]
+ }
+ 
+diff --git a/build/config/aros/v8_library/generate_v8_imports.py b/build/config/aros/v8_library/generate_v8_imports.py
+index 2f1e6e77a3..7d1c4ec594 100644
+--- a/build/config/aros/v8_library/generate_v8_imports.py
++++ b/build/config/aros/v8_library/generate_v8_imports.py
+@@ -3,11 +3,15 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
+-"""Generates the x86-64 AROS import trampolines for v8.library."""
++"""Generates the AROS import trampolines for v8.library (x86-64 or AArch64)."""
+ 
+ import argparse
+ import pathlib
+ import re
++import sys
++
++sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
++import import_trampolines_arm64  # noqa: E402
+ 
+ 
+ _SYMBOL_RE = re.compile(r"^[_A-Za-z][_A-Za-z0-9.$]*$")
+@@ -215,11 +219,25 @@ def main() -> None:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--manifest", required=True, type=pathlib.Path)
+     parser.add_argument("--output", required=True, type=pathlib.Path)
++    parser.add_argument("--cpu", choices=("x64", "arm64"), default="x64")
+     args = parser.parse_args()
+ 
+     symbols = _read_manifest(args.manifest)
++    if args.cpu == "arm64":
++        text = import_trampolines_arm64.emit(
++            generator="generate_v8_imports.py",
++            symbols=symbols,
++            slow_path="ArosV8ImportSlowPath",
++            resolver="ArosResolveV8Import",
++            slots="g_v8_import_slots",
++            count="g_v8_import_count",
++            names="g_v8_import_names",
++            data_imports=_DATA_IMPORTS,
++        )
++    else:
++        text = _emit(symbols)
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+-    args.output.write_text(_emit(symbols), encoding="utf-8")
++    args.output.write_text(text, encoding="utf-8")
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.50.1 (Apple Git-155)
+

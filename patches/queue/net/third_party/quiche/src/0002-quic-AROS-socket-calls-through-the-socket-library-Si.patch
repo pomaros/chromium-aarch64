@@ -1,0 +1,103 @@
+From bdac0494a7a85d8a57e3189e817a145585ae9215 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 12:16:32 +0200
+Subject: [PATCH] quic: AROS socket calls through the socket library; Size() in
+ the interval deque [quiche] [aros]
+
+getsockname(), inet_pton() and inet_ntop() go through base::aros (one
+bsdsocket base per task, as the name lookup already does); the AROS SDK
+declares no POSIX socket functions. QuicIntervalDeque's iterator checked
+against a size() its deque does not have (it is Size()); clang 20 reports
+that in the template definition.
+---
+ quiche/common/quiche_ip_address.cc              | 13 +++++++++++++
+ quiche/quic/core/quic_interval_deque.h          |  4 ++--
+ quiche/quic/platform/api/quic_socket_address.cc |  8 ++++++++
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/quiche/common/quiche_ip_address.cc b/quiche/common/quiche_ip_address.cc
+index 342597b..9acf6fb 100644
+--- a/quiche/common/quiche_ip_address.cc
++++ b/quiche/common/quiche_ip_address.cc
+@@ -10,6 +10,9 @@
+ #include <string>
+ 
+ #include "absl/strings/str_cat.h"
++#if defined(__AROS__)
++#include "base/aros/socket_library.h"
++#endif
+ #include "quiche/common/platform/api/quiche_bug_tracker.h"
+ #include "quiche/common/platform/api/quiche_logging.h"
+ #include "quiche/common/quiche_ip_address_family.h"
+@@ -114,7 +117,12 @@ std::string QuicheIpAddress::ToString() const {
+ 
+   char buffer[INET6_ADDRSTRLEN] = {0};
+   const char* result =
++#if defined(__AROS__)
++      base::aros::SocketInetNtop(AddressFamilyToInt(), address_.bytes, buffer,
++                                 sizeof(buffer));
++#else
+       inet_ntop(AddressFamilyToInt(), address_.bytes, buffer, sizeof(buffer));
++#endif
+   QUICHE_BUG_IF(quiche_bug_10126_4, result == nullptr)
+       << "Failed to convert an IP address to string";
+   return buffer;
+@@ -170,7 +178,12 @@ bool QuicheIpAddress::FromString(std::string str) {
+   for (IpAddressFamily family :
+        {IpAddressFamily::IP_V6, IpAddressFamily::IP_V4}) {
+     int result =
++#if defined(__AROS__)
++        base::aros::SocketInetPton(ToPlatformAddressFamily(family), str.c_str(),
++                                   address_.bytes);
++#else
+         inet_pton(ToPlatformAddressFamily(family), str.c_str(), address_.bytes);
++#endif
+     if (result > 0) {
+       family_ = family;
+       return true;
+diff --git a/quiche/quic/core/quic_interval_deque.h b/quiche/quic/core/quic_interval_deque.h
+index 0aa4543..5ca3cc9 100644
+--- a/quiche/quic/core/quic_interval_deque.h
++++ b/quiche/quic/core/quic_interval_deque.h
+@@ -198,12 +198,12 @@ class QUICHE_NO_EXPORT QuicIntervalDeque {
+     Iterator operator+(difference_type amount) const {
+       Iterator copy = *this;
+       copy.index_ += amount;
+-      QUICHE_DCHECK(copy.index_ < copy.deque_->size());
++      QUICHE_DCHECK(copy.index_ < copy.deque_->Size());
+       return copy;
+     }
+     Iterator& operator+=(difference_type amount) {
+       index_ += amount;
+-      QUICHE_DCHECK(index_ < deque_->size());
++      QUICHE_DCHECK(index_ < deque_->Size());
+       return *this;
+     }
+     difference_type operator-(const Iterator& rhs) const {
+diff --git a/quiche/quic/platform/api/quic_socket_address.cc b/quiche/quic/platform/api/quic_socket_address.cc
+index f14faea..d782127 100644
+--- a/quiche/quic/platform/api/quic_socket_address.cc
++++ b/quiche/quic/platform/api/quic_socket_address.cc
+@@ -9,6 +9,9 @@
+ #include <string>
+ 
+ #include "absl/strings/str_cat.h"
++#if defined(__AROS__)
++#include "base/aros/socket_library.h"
++#endif
+ #include "quiche/quic/platform/api/quic_bug_tracker.h"
+ #include "quiche/quic/platform/api/quic_ip_address.h"
+ #include "quiche/quic/platform/api/quic_ip_address_family.h"
+@@ -97,7 +100,12 @@ std::string QuicSocketAddress::ToString() const {
+ int QuicSocketAddress::FromSocket(int fd) {
+   sockaddr_storage addr;
+   socklen_t addr_len = sizeof(addr);
++#if defined(__AROS__)
++  int result = base::aros::GetSocketName(fd, reinterpret_cast<sockaddr*>(&addr),
++                                         &addr_len);
++#else
+   int result = getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &addr_len);
++#endif
+ 
+   bool success = result == 0 && addr_len > 0 &&
+                  static_cast<size_t>(addr_len) <= sizeof(addr);

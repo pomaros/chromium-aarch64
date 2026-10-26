@@ -1,0 +1,906 @@
+From: John Knipper <code@jkn.me>
+Subject: [PATCH] aros: use native 64-bit PartitionAlloc pages
+
+Infer pointer width from the actual CPU. Use native kernel mappings and
+checked protection, release real alignment slack and track exact ownership.
+Bound eagerly backed pools by available memory rather than physical block
+contiguity. Concurrent first use additionally requires serialized native
+pthread mutex initialization; this patch does not implement demand paging.
+
+diff --git a/base/allocator/partition_allocator/partition_alloc.gni b/base/allocator/partition_allocator/partition_alloc.gni
+--- a/base/allocator/partition_allocator/partition_alloc.gni
++++ b/base/allocator/partition_allocator/partition_alloc.gni
+@@ -19,11 +19,6 @@
+ # A static_assert in partition_alloc_config.h verifies that.
+ if (is_nacl) {
+   # NaCl targets don't use 64-bit pointers.
+-  has_64_bit_pointers = false
+-} else if (is_aros) {
+-  # AROS has no reserve-without-commit: a size-aligned pool is a physically
+-  # backed block of twice its size. Take the configuration that reserves
+-  # super pages one at a time, on demand, and tracks them in a bitmap.
+   has_64_bit_pointers = false
+ } else if (current_cpu == "x64" || current_cpu == "arm64" ||
+            current_cpu == "loong64" || current_cpu == "riscv64") {
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_config.h b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_config.h
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_config.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_config.h
+@@ -32,7 +32,7 @@
+ // configurations.
+ #if BUILDFLAG(HAS_64_BIT_POINTERS)
+ static_assert(sizeof(void*) == 8, "");
+-#elif !BUILDFLAG(IS_AROS)
++#else
+ static_assert(sizeof(void*) != 8, "");
+ #endif  // PA_CONFIG(HAS_64_BITS_POINTERS)
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
+@@ -109,35 +109,18 @@
+
+ namespace {
+
+-// The regular pool is sized from the memory free when the process starts.
+-//
+-// On AROS a pool is physically backed (see kPoolMaxSize), and until exec has
+-// an aligned allocator it costs twice its size: AllocPagesWithAlignOffset
+-// over-reserves to align the pool to itself and cannot give the slack back
+-// (JOB-0104 exec-allocmemaligned-proposal.md). A fixed 1 GiB regular pool is
+-// therefore a fixed 2 GiB bite out of the machine for every process, which is
+-// what capped a 12 GiB guest at browser + one child (JOB-0104 tset12): the
+-// third process found a largest free block of 1.18 GiB and PA_CHECKed.
+-//
+-// So: the largest power of two at or below a quarter of free memory, which
+-// keeps the pool's 2x reservation at or below half of what is free, and at or
+-// below half of the largest free block, which is what the over-reserve needs
+-// in one piece. The browser, first in, still gets kRegularPoolSize; each child
+-// takes a share of what is left, so the guest degrades to smaller renderers
+-// instead of to none. Below kMinRegularPoolSize a renderer cannot do useful
+-// work anyway; the pool reservation then fails and the process dies in
+-// HandlePoolAllocFailure, which is JOB-0095's sad tab once the browser can
+-// see a child die.
+-//
+-// The result is cached: Init() and UninitForTesting() must see the same size,
+-// and a second AvailMem() after the pools are reserved would see less.
++// Native mappings have contiguous virtual addresses and separately allocated
++// physical pages. Reservations are eagerly backed, so keep the temporary 2x
++// alignment reservation within half the free memory. Native trim releases the
++// alignment slack immediately. The largest physical block does not limit this
++// allocation. Cache the size so pool initialization and teardown agree.
+ constexpr size_t kMinRegularPoolSize = kGiB / 8;
+ constexpr size_t kFreeMemoryDivisor = 4;
+
+ // Ceiling for a child that is neither a renderer nor the browser: the GPU
+ // process and the utility processes (network, storage, audio, ...) never come
+-// near the pool the free-memory rule would give them, and every byte of it is
+-// physically backed twice. The browser and renderers keep the full rule.
++// near the pool the free-memory rule would give them. Their reservations are
++// eagerly backed too. The browser and renderers keep the full rule.
+ //
+ // The process type is read from the argument string CreateNewProc() gave this
+ // process (NP_Arguments, launch_aros.cc), since the pool is reserved long
+@@ -206,9 +189,7 @@
+
+   const IPTR free_bytes = AvailMem(MEMF_PUBLIC);
+   const IPTR largest = AvailMem(MEMF_PUBLIC | MEMF_LARGEST);
+-  const size_t budget =
+-      std::min(static_cast<size_t>(free_bytes) / kFreeMemoryDivisor,
+-               static_cast<size_t>(largest) / 2);
++  const size_t budget = static_cast<size_t>(free_bytes) / kFreeMemoryDivisor;
+   size_t size = std::bit_floor(budget);
+   const size_t cap = ArosProcessTypePoolCap(max_size);
+   size = std::clamp(size, kMinRegularPoolSize, cap);
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_constants.h b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_constants.h
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_constants.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_constants.h
+@@ -313,19 +313,10 @@
+ // 8GB for each of the glued pools).
+ #if BUILDFLAG(HAS_64_BIT_POINTERS)
+ #if BUILDFLAG(IS_AROS)
+-// KrnAllocPages() currently provides physically backed pages rather than a
+-// sparse virtual reservation. Keep the pre-MMU pools bounded until AROS can
+-// reserve and commit address space independently. The regular pool also
+-// carries malloc() when the allocator shim is in use, so it gets the maximum;
+-// the smaller pools size themselves in partition_address_space.h.
+-//
+-// The pool must be aligned to its own size, and PartitionAlloc gets that by
+-// reserving twice the pool and trimming - so the machine has to hand over one
+-// contiguous block of 2 * kPoolMaxSize, physically. At 2 GiB that is a 4 GiB
+-// block, which an installed system can find but a Live CD cannot: booting the
+-// ISO on a 12 GB machine leaves a largest free block of 3.57 GB and Chromium
+-// dies in PostEarlyInitialization before it ever draws a window. 1 GiB keeps
+-// the reservation at 2 GiB and fits.
++// Native mappings are virtually contiguous but eagerly physically backed.
++// Bound pool capacity until reservation and physical commit are independent.
++// Alignment temporarily reserves twice the pool; native trim releases slack.
++// The regular pool also backs malloc() when the allocator shim is enabled.
+ constexpr size_t kPoolMaxSize = 1 * kGiB;
+ #elif BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS) || \
+     BUILDFLAG(ENABLE_POINTER_COMPRESSION)
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_aros.h b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_aros.h
+--- a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_aros.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_aros.h
+@@ -32,7 +32,7 @@
+
+ namespace partition_alloc::internal {
+
+-// KrnAllocPages treats a non-null address as an exact physical-page request.
++// KrnAllocPages treats a non-null address as an exact native mapping request.
+ constexpr bool kHintIsAdvisory = false;
+ std::atomic<int32_t> s_allocPageErrorCode{0};
+
+@@ -63,236 +63,77 @@
+   return static_cast<KRN_MapAttr>(0);
+ }
+
+-void SetProtection(APTR KernelBase,
++struct PageAllocationRecord {
++  PageAllocationRecord* next;
++  uintptr_t base;
++  size_t length;
++};
++
++// Ownership belongs to native kernel mappings. Exec allocates only these small
++// metadata records, never backing or alignment slack for a page reservation.
++pthread_mutex_t s_pageAllocationLock = PTHREAD_MUTEX_INITIALIZER;
++PageAllocationRecord* s_pageAllocations = nullptr;
++
++bool ValidPageRange(uintptr_t address, size_t length) {
++  const size_t mask = PageAllocationGranularity() - 1;
++  return length && !(address & mask) && !(length & mask) &&
++         address <= std::numeric_limits<uintptr_t>::max() - length;
++}
++
++PageAllocationRecord* NewPageAllocationRecord() {
++  return static_cast<PageAllocationRecord*>(
++      AllocMem(sizeof(PageAllocationRecord), MEMF_PUBLIC | MEMF_CLEAR));
++}
++
++// The caller holds the mutex. Separate records must not be crossed by one
++// release/protection request, even when adjacent virtual addresses happen to fit.
++PageAllocationRecord** FindPageAllocation(uintptr_t address, size_t length) {
++  if (!ValidPageRange(address, length)) {
++    return nullptr;
++  }
++  for (auto** link = &s_pageAllocations; *link; link = &(*link)->next) {
++    const auto* record = *link;
++    if (address >= record->base) {
++      const size_t offset = address - record->base;
++      if (offset < record->length && length <= record->length - offset) {
++        return link;
++      }
++    }
++  }
++  return nullptr;
++}
++
++KRN_PageProtect GetPageProtector(APTR KernelBase) {
++  (void)KernelBase;  // Used by the native kernel vector call macros.
++  const intptr_t operation = KrnGetSystemAttr(KATTR_PageProtect);
++  if (!operation || operation == -1) {
++    return nullptr;
++  }
++  return reinterpret_cast<KRN_PageProtect>(operation);
++}
++
++bool SetProtection(KRN_PageProtect protect,
+                    uintptr_t address,
+                    size_t length,
+                    KRN_MapAttr flags) {
+-  constexpr size_t kMaxChunk =
+-      static_cast<size_t>(std::numeric_limits<uint32_t>::max()) & ~size_t{4095};
+-
++  if (!protect || !ValidPageRange(address, length)) {
++    return false;
++  }
++  const size_t max_chunk =
++      static_cast<size_t>(std::numeric_limits<uint32_t>::max()) &
++      ~(PageAllocationGranularity() - 1);
+   while (length) {
+-    const size_t chunk = std::min(length, kMaxChunk);
+-    KrnSetProtection(reinterpret_cast<void*>(address),
+-                     static_cast<uint32_t>(chunk), flags);
++    const size_t chunk = std::min(length, max_chunk);
++    if (!protect(reinterpret_cast<void*>(address),
++                 static_cast<uint32_t>(chunk), flags)) {
++      // The checked native operation may have converted a prefix. It does not
++      // provide an atomic rollback for a multi-page protection change.
++      return false;
++    }
+     address += chunk;
+     length -= chunk;
+   }
+-}
+-
+-struct PageAllocationRecord {
+-  PageAllocationRecord* next;
+-  uintptr_t exposed_base;
+-  size_t exposed_length;
+-  uintptr_t protected_base;
+-  size_t protected_length;
+-  void* allocation_base;
+-  size_t allocation_length;
+-  bool exec_owned;
+-};
+-
+-enum class PageAllocationReleaseKind {
+-  kInvalid,
+-  kRetainedSuffix,
+-  kWhole,
+-};
+-
+-struct PageAllocationRelease {
+-  PageAllocationReleaseKind kind = PageAllocationReleaseKind::kInvalid;
+-  PageAllocationRecord* record = nullptr;
+-  uintptr_t exposed_base = 0;
+-  size_t exposed_length = 0;
+-};
+-
+-// A blocking mutex, not a spin: AROS schedules strictly by task priority and
+-// the hosted build has one CPU, so a higher-priority thread spinning on a
+-// flag that a preempted lower-priority thread still holds never lets the
+-// holder run again (the whole guest sat at 100% in such a loop).  The
+-// pthread mutex sleeps on an exec semaphore instead - the same primitive
+-// PartitionAlloc's own SpinningMutex uses on this platform.
+-pthread_mutex_t s_pageAllocationLock = PTHREAD_MUTEX_INITIALIZER;
+-PageAllocationRecord* s_pageAllocations = nullptr;
+-
+-void LockPageAllocations() {
+-  pthread_mutex_lock(&s_pageAllocationLock);
+-}
+-
+-void UnlockPageAllocations() {
+-  pthread_mutex_unlock(&s_pageAllocationLock);
+-}
+-
+-bool TrackPageAllocation(uintptr_t exposed_base,
+-                         size_t exposed_length,
+-                         uintptr_t protected_base,
+-                         size_t protected_length,
+-                         void* allocation_base,
+-                         size_t allocation_length,
+-                         bool exec_owned) {
+-  auto* record = static_cast<PageAllocationRecord*>(
+-      AllocMem(sizeof(PageAllocationRecord), MEMF_PUBLIC | MEMF_CLEAR));
+-  if (!record) {
+-    return false;
+-  }
+-
+-  record->exposed_base = exposed_base;
+-  record->exposed_length = exposed_length;
+-  record->protected_base = protected_base;
+-  record->protected_length = protected_length;
+-  record->allocation_base = allocation_base;
+-  record->allocation_length = allocation_length;
+-  record->exec_owned = exec_owned;
+-
+-  LockPageAllocations();
+-  record->next = s_pageAllocations;
+-  s_pageAllocations = record;
+-  UnlockPageAllocations();
+   return true;
+-}
+-
+-PageAllocationRelease PreparePageAllocationRelease(uintptr_t address,
+-                                                    size_t length) {
+-  PageAllocationRelease release;
+-  PageAllocationRecord* record;
+-  PageAllocationRecord* previous = nullptr;
+-
+-  LockPageAllocations();
+-  for (record = s_pageAllocations; record; record = record->next) {
+-    if (address == record->exposed_base &&
+-        length == record->exposed_length) {
+-      if (previous) {
+-        previous->next = record->next;
+-      } else {
+-        s_pageAllocations = record->next;
+-      }
+-      release.kind = PageAllocationReleaseKind::kWhole;
+-      release.record = record;
+-      break;
+-    }
+-
+-    if (address > record->exposed_base) {
+-      const size_t offset = address - record->exposed_base;
+-      if (offset < record->exposed_length &&
+-          length == record->exposed_length - offset) {
+-        record->exposed_length = offset;
+-        release.kind = PageAllocationReleaseKind::kRetainedSuffix;
+-        release.exposed_base = record->exposed_base;
+-        release.exposed_length = record->exposed_length;
+-        break;
+-      }
+-
+-      if (offset < record->exposed_length) {
+-        break;
+-      }
+-    }
+-
+-    if (address == record->exposed_base) {
+-      break;
+-    }
+-    previous = record;
+-  }
+-  UnlockPageAllocations();
+-  return release;
+-}
+-
+-void LogTrimmedExecSlack(uintptr_t result,
+-                         size_t trim_length,
+-                         size_t released,
+-                         void* allocation_base,
+-                         size_t allocation_length) {
+-  char line[224];
+-  std::snprintf(
+-      line, sizeof(line),
+-      "[Chromium:PA] trim-exec address=%p len=%llu released=%llu "
+-      "allocation=%p+%llu\n",
+-      reinterpret_cast<void*>(result),
+-      static_cast<unsigned long long>(trim_length),
+-      static_cast<unsigned long long>(released), allocation_base,
+-      static_cast<unsigned long long>(allocation_length));
+-  ArosKPutStr(line);
+-}
+-
+-// Exec memory is physically backed, and an aligned pool reservation
+-// over-allocates by its alignment (the 2 GiB regular pool asks for 4 GiB and
+-// trims to 2 GiB), so the slack is dead weight. It used to be given back the
+-// way exec's own LibAllocAligned() does it -- Forbid(); FreeMem(whole);
+-// AllocAbs(kept) -- but that idiom cannot be used here:
+-//
+-//   * Forbid() does not stop the other CPUs on an SMP kernel, so the whole
+-//     block is briefly free to every other task.
+-//   * It drives exec into tlsf_allocabs(), whose split paths are the least
+-//     exercised in the allocator. On the native pc-x86_64-smp guest the
+-//     released tail came straight back as a corrupted free-list link: the
+-//     5 GiB free block that starts at the released address carried
+-//     free_node.next = 0x20, and the next AllocAbs() faulted walking it
+-//     (CR2=0x28, rip=tlsf_allocabs+0x99, alert 0x80000003). Because the
+-//     fault is raised while the caller holds the MemHeader spinlock, the
+-//     alert path deadlocks against itself and the machine freezes with no
+-//     output (TRIG-1005/1006).
+-//
+-// So the slack now stays with the block: the reservation keeps the memory it
+-// was given, and the record only remembers which window is exposed. This
+-// costs the alignment slack in RSS (2 GiB for the regular pool) until exec
+-// grows a real aligned allocator that does not go through AllocAbs.
+-void ReleaseTrimmedExecSlack(PageAllocationRecord* record,
+-                             uintptr_t result,
+-                             size_t trim_length,
+-                             PageAccessibilityConfiguration accessibility) {
+-  const uintptr_t alloc_base =
+-      reinterpret_cast<uintptr_t>(record->allocation_base);
+-  const uintptr_t alloc_end = alloc_base + record->allocation_length;
+-  if (result == alloc_base && result + trim_length == alloc_end) {
+-    return;
+-  }
+-
+-  APTR KernelBase = OpenKernelResource();
+-  PA_CHECK(KernelBase);
+-
+-  record->protected_base = result;
+-  record->protected_length = trim_length;
+-
+-  SetProtection(KernelBase, result, trim_length,
+-                GetAccessFlags(accessibility));
+-  LogTrimmedExecSlack(result, trim_length, 0, record->allocation_base,
+-                      record->allocation_length);
+-}
+-
+-bool RetainTrimmedPageAllocation(uintptr_t base_address,
+-                                 size_t base_length,
+-                                 uintptr_t result,
+-                                 size_t trim_length,
+-                                 PageAccessibilityConfiguration accessibility) {
+-  PageAllocationRecord* found = nullptr;
+-
+-  LockPageAllocations();
+-  for (PageAllocationRecord* record = s_pageAllocations; record;
+-       record = record->next) {
+-    if (record->exposed_base == base_address &&
+-        record->exposed_length == base_length) {
+-      record->exposed_base = result;
+-      record->exposed_length = trim_length;
+-      found = record;
+-      break;
+-    }
+-  }
+-  UnlockPageAllocations();
+-
+-  // The record belongs to the caller's reservation alone, so its backing can
+-  // be reshaped outside the list lock.
+-  if (found && found->exec_owned) {
+-    ReleaseTrimmedExecSlack(found, result, trim_length, accessibility);
+-  }
+-  return found != nullptr;
+-}
+-
+-void* AllocateExecPages(size_t length,
+-                        ULONG flags,
+-                        size_t* allocation_length) {
+-  const size_t granularity = PageAllocationGranularity();
+-  if (length > std::numeric_limits<size_t>::max() - granularity) {
+-    return nullptr;
+-  }
+-
+-  *allocation_length = length + granularity;
+-  return AllocMem(*allocation_length, flags);
+ }
+
+ void LogLargePageAllocation(uintptr_t hint,
+@@ -322,52 +163,8 @@
+   CloseLibrary(DebugBase);
+ }
+
+-void LogInvalidPageFree(uintptr_t address, size_t length) {
+-  char line[192];
+-  struct Library* DebugBase = OpenLibrary("debug.library", 0);
+-  if (!DebugBase) {
+-    return;
+-  }
+-
+-  std::snprintf(
+-      line, sizeof(line),
+-      "[Chromium:PA] rejected invalid or untracked page free address=%p "
+-      "len=%llu\n",
+-      reinterpret_cast<void*>(address),
+-      static_cast<unsigned long long>(length));
+-  ArosKPutStr(line);
+-  CloseLibrary(DebugBase);
+-}
+-
+-void LogRetainedPageSuffix(uintptr_t address,
+-                           size_t length,
+-                           uintptr_t exposed_base,
+-                           size_t exposed_length) {
+-  char line[256];
+-  struct Library* DebugBase = OpenLibrary("debug.library", 0);
+-  if (!DebugBase) {
+-    return;
+-  }
+-
+-  std::snprintf(
+-      line, sizeof(line),
+-      "[Chromium:PA] retained physical page suffix address=%p len=%llu "
+-      "logical=%p+%llu\n",
+-      reinterpret_cast<void*>(address),
+-      static_cast<unsigned long long>(length),
+-      reinterpret_cast<void*>(exposed_base),
+-      static_cast<unsigned long long>(exposed_length));
+-  ArosKPutStr(line);
+-  CloseLibrary(DebugBase);
+-}
+-
+-// Ownership trace from the viz gather_8888 investigation: page-level events
+-// were logged so a faulting address could be matched to the reservation,
+-// decommit or protection change that made it fault. That fault is explained
+-// (the exec-slack PROT_NONE memset, fixed in 001f83966d), so the trace is off:
+-// with it on, decommits alone were 6741 of the 7024 serial lines of a
+-// two-minute run, each a synchronous kernel serial write on the raster path.
+-// Set kTracePageEvents to re-arm it for the next ownership question.
++// Detailed ownership tracing is opt-in; ordinary allocator traffic must not
++// synchronously print every page operation.
+ constexpr bool kTracePageEvents = false;
+
+ void TracePageEvent(const char* what,
+@@ -399,94 +196,67 @@
+     s_allocPageErrorCode = ENOTSUP;
+     return 0;
+   }
+-
+-  APTR KernelBase = OpenKernelResource();
+-  if (!KernelBase) {
++  if (!ValidPageRange(hint, length)) {
++    s_allocPageErrorCode = EINVAL;
++    return 0;
++  }
++  APTR KernelBase = OpenKernelResource();
++  const auto protect = KernelBase ? GetPageProtector(KernelBase) : nullptr;
++  if (!protect) {
+     s_allocPageErrorCode = ENOSYS;
+     return 0;
+   }
+
+   ULONG flags = MEMF_PUBLIC | MEMF_CLEAR;
++  const KRN_MapAttr protection = GetAccessFlags(accessibility);
+   if (accessibility.permissions ==
+           PageAccessibilityConfiguration::kInaccessibleWillJitLater ||
+-      (GetAccessFlags(accessibility) & MAP_Executable)) {
++      (protection & MAP_Executable)) {
+     flags |= MEMF_EXECUTABLE;
+   }
+-
+-  constexpr size_t kLargePageRequest = 64 * 1024 * 1024;
+-  const bool log_request = length >= kLargePageRequest;
++  const bool log_request = length >= 64 * 1024 * 1024;
+   const IPTR available = log_request ? AvailMem(MEMF_PUBLIC) : 0;
+   const IPTR largest =
+       log_request ? AvailMem(MEMF_PUBLIC | MEMF_LARGEST) : 0;
+-  const KRN_MapAttr protection = GetAccessFlags(accessibility);
+-  // The transition-era kernel backend cannot yet provide anonymous pages for
+-  // large unhinted reservations. Go straight to the tracked Exec bridge for
+-  // those requests instead of paying for a known-failing kernel probe.
+-  const bool skip_kernel_anonymous_probe = !hint && log_request;
+-  void* result = skip_kernel_anonymous_probe
+-                     ? nullptr
+-                     : KrnAllocPages(reinterpret_cast<void*>(hint), length,
+-                                     flags);
+-  bool exec_owned = false;
+-  void* allocation_base = result;
+-  size_t allocation_length = length;
+-
++  void* result = KrnAllocPages(reinterpret_cast<void*>(hint), length, flags);
+   if (!result) {
+-    if (log_request && !skip_kernel_anonymous_probe) {
++    s_allocPageErrorCode = ENOMEM;
++    if (log_request) {
+       LogLargePageAllocation(hint, length, protection, available, largest,
+-                             "kernel", result, ENOMEM);
+-    }
+-
+-    // The transition-era Exec MemHeaders are not initialized for mm_linear,
+-    // so KrnAllocPages cannot yet provide anonymous pages. Exact-address
+-    // requests must fail, but an unhinted request can use tracked Exec backing.
+-    if (hint) {
+-      s_allocPageErrorCode = ENOMEM;
+-      return 0;
+-    }
+-
+-    // This bridge has physical backing even for inaccessible reservations.
+-    // Keep it zeroed so the first accessible slice has anonymous-page commit
+-    // semantics without destroying data on later permission-only changes.
+-    allocation_base = AllocateExecPages(length, flags, &allocation_length);
+-    if (!allocation_base) {
+-      s_allocPageErrorCode = ENOMEM;
+-      if (log_request) {
+-        LogLargePageAllocation(hint, length, protection, available, largest,
+-                               "exec", nullptr, ENOMEM);
+-      }
+-      return 0;
+-    }
+-
+-    const uintptr_t granularity_mask = PageAllocationGranularity() - 1;
+-    result = reinterpret_cast<void*>(
+-        (reinterpret_cast<uintptr_t>(allocation_base) + granularity_mask) &
+-        ~granularity_mask);
+-    exec_owned = true;
+-  }
+-
+-  if (!TrackPageAllocation(reinterpret_cast<uintptr_t>(result), length,
+-                           reinterpret_cast<uintptr_t>(result), length,
+-                           allocation_base, allocation_length, exec_owned)) {
+-    if (exec_owned) {
+-      FreeMem(allocation_base, allocation_length);
+-    } else {
+-      KrnFreePages(result, length);
+-    }
++                             "kernel", nullptr, ENOMEM);
++    }
++    return 0;
++  }
++  const auto address = reinterpret_cast<uintptr_t>(result);
++  if (!ValidPageRange(address, length) || (hint && address != hint)) {
++    KrnFreePages(result, length);
+     s_allocPageErrorCode = ENOMEM;
+     return 0;
+   }
+-
+-  SetProtection(KernelBase, reinterpret_cast<uintptr_t>(result), length,
+-                protection);
++  if (!SetProtection(protect, address, length, protection)) {
++    KrnFreePages(result, length);
++    s_allocPageErrorCode = EACCES;
++    return 0;
++  }
++  auto* record = NewPageAllocationRecord();
++  if (!record) {
++    KrnFreePages(result, length);
++    s_allocPageErrorCode = ENOMEM;
++    return 0;
++  }
++  record->base = address;
++  record->length = length;
++  pthread_mutex_lock(&s_pageAllocationLock);
++  record->next = s_pageAllocations;
++  s_pageAllocations = record;
++  pthread_mutex_unlock(&s_pageAllocationLock);
+   s_allocPageErrorCode = 0;
+-  TracePageEvent(exec_owned ? "alloc-exec" : "alloc-kernel",
+-                 reinterpret_cast<uintptr_t>(result), length, protection);
++  TracePageEvent("alloc-kernel", address, length, protection);
+   if (log_request) {
+     LogLargePageAllocation(hint, length, protection, available, largest,
+-                           exec_owned ? "exec" : "kernel", result, 0);
+-  }
+-  return reinterpret_cast<uintptr_t>(result);
++                           "kernel", result, 0);
++  }
++  return address;
+ }
+
+ bool TrySetSystemPagesAccessInternal(
+@@ -494,12 +264,16 @@
+     size_t length,
+     PageAccessibilityConfiguration accessibility) {
+   APTR KernelBase = OpenKernelResource();
+-  if (!KernelBase) {
++  const auto protect = KernelBase ? GetPageProtector(KernelBase) : nullptr;
++  if (!protect) {
+     return false;
+   }
+-  SetProtection(KernelBase, address, length, GetAccessFlags(accessibility));
++  pthread_mutex_lock(&s_pageAllocationLock);
++  const bool changed = FindPageAllocation(address, length) &&
++      SetProtection(protect, address, length, GetAccessFlags(accessibility));
++  pthread_mutex_unlock(&s_pageAllocationLock);
+   TracePageEvent("set-access", address, length, GetAccessFlags(accessibility));
+-  return true;
++  return changed;
+ }
+
+ void SetSystemPagesAccessInternal(
+@@ -512,75 +286,91 @@
+ void FreePagesInternal(uintptr_t address, size_t length) {
+   APTR KernelBase = OpenKernelResource();
+   PA_CHECK(KernelBase);
+-  TracePageEvent("free", address, length, 0);
+-  PageAllocationRelease release = PreparePageAllocationRelease(address, length);
+-  if (release.kind == PageAllocationReleaseKind::kRetainedSuffix) {
+-    // AROS has no sparse virtual unmap yet. Preserve ownership of the original
+-    // contiguous block while making the suffix unavailable to PartitionAlloc;
+-    // the exact final free releases all retained physical backing.
+-    LogRetainedPageSuffix(address, length, release.exposed_base,
+-                          release.exposed_length);
++  PageAllocationRecord* split = nullptr;
++  for (;;) {
++    pthread_mutex_lock(&s_pageAllocationLock);
++    auto** link = FindPageAllocation(address, length);
++    if (!link) {
++      pthread_mutex_unlock(&s_pageAllocationLock);
++      if (split) {
++        FreeMem(split, sizeof(PageAllocationRecord));
++      }
++      PA_CHECK(link);
++      return;
++    }
++    auto* record = *link;
++    const size_t prefix = address - record->base;
++    const size_t suffix = record->length - prefix - length;
++    if (prefix && suffix && !split) {
++      pthread_mutex_unlock(&s_pageAllocationLock);
++      split = NewPageAllocationRecord();
++      PA_CHECK(split);
++      continue;  // Revalidate after allocating outside the ownership lock.
++    }
++    PageAllocationRecord* retired = nullptr;
++    if (!prefix && !suffix) {
++      *link = record->next;
++      retired = record;
++    } else if (!prefix) {
++      record->base += length;
++      record->length = suffix;
++    } else {
++      record->length = prefix;
++      if (suffix) {
++        split->base = address + length;
++        split->length = suffix;
++        split->next = record->next;
++        record->next = split;
++        split = nullptr;
++      }
++    }
++    // KrnFreePages owns unmapping and backing retirement in the native window.
++    // Its public API is void: do not claim a recoverable status from this call.
++    KrnFreePages(reinterpret_cast<void*>(address), length);
++    pthread_mutex_unlock(&s_pageAllocationLock);
++    if (retired) {
++      FreeMem(retired, sizeof(PageAllocationRecord));
++    }
++    if (split) {
++      FreeMem(split, sizeof(PageAllocationRecord));
++    }
++    TracePageEvent("free", address, length, 0);
+     return;
+   }
+-
+-  PageAllocationRecord* record = release.record;
+-  if (release.kind != PageAllocationReleaseKind::kWhole || !record) {
+-    // Every mapping created by this backend is tracked. Passing an unknown
+-    // address to KrnFreePages can mistake an Exec-managed MemHeader for an
+-    // mm_linear header, so preserve the caller context with a controlled
+-    // PartitionAlloc failure instead of crossing that ownership boundary.
+-    LogInvalidPageFree(address, length);
+-    PA_CHECK(record);
+-    return;
+-  }
+-
+-  // The pages go back to a pool whose memory is executable by default (the
+-  // hosted RAM block is mapped RWX, the ELF loader puts code anywhere); leave
+-  // them as they were found, or the next program loaded into them faults on
+-  // its first instruction.
+-  //
+-  // For an Exec-backed reservation that must cover the WHOLE block, not just
+-  // the window PartitionAlloc kept: the reservation set its (usually
+-  // inaccessible) protection over the full aligned result, and a later trim
+-  // narrows protected_base/protected_length to the kept window without
+-  // touching the slack it cut off. Restoring only the window handed exec
+-  // free memory with PROT_NONE pages inside it; the next AllocMem(MEMF_CLEAR)
+-  // to land there faulted in the kernel's memset (tlsf_malloc <- AllocMem
+-  // <- v8 OS::Allocate on a worker isolate, CR2 = the first slack page).
+-  if (record->exec_owned) {
+-    const uintptr_t page_mask = PageAllocationGranularity() - 1;
+-    const uintptr_t span_base =
+-        reinterpret_cast<uintptr_t>(record->allocation_base) & ~page_mask;
+-    const uintptr_t span_end =
+-        (reinterpret_cast<uintptr_t>(record->allocation_base) +
+-         record->allocation_length + page_mask) &
+-        ~page_mask;
+-    SetProtection(KernelBase, span_base, span_end - span_base,
+-                  static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable |
+-                                           MAP_Executable));
+-  } else {
+-    SetProtection(KernelBase, record->protected_base,
+-                  record->protected_length,
+-                  static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable |
+-                                           MAP_Executable));
+-  }
+-  if (record->exec_owned) {
+-    FreeMem(record->allocation_base, record->allocation_length);
+-  } else {
+-    KrnFreePages(record->allocation_base, record->allocation_length);
+-  }
+-  FreeMem(record, sizeof(PageAllocationRecord));
+ }
+
+ uintptr_t TrimMappingInternal(uintptr_t base_address,
+                               size_t base_length,
+                               size_t trim_length,
+-                              PageAccessibilityConfiguration accessibility,
++                              PageAccessibilityConfiguration,
+                               size_t pre_slack,
+-                              size_t) {
++                              size_t post_slack) {
++  PA_CHECK(ValidPageRange(base_address, base_length));
++  PA_CHECK(pre_slack <= base_length);
++  PA_CHECK(trim_length <= base_length - pre_slack);
++  PA_CHECK(post_slack == base_length - pre_slack - trim_length);
+   const uintptr_t result = base_address + pre_slack;
+-  PA_CHECK(RetainTrimmedPageAllocation(base_address, base_length, result,
+-                                       trim_length, accessibility));
++  PA_CHECK(ValidPageRange(result, trim_length));
++  const size_t mask = PageAllocationGranularity() - 1;
++  PA_CHECK(!(pre_slack & mask) && !(post_slack & mask));
++  APTR KernelBase = OpenKernelResource();
++  PA_CHECK(KernelBase);
++  pthread_mutex_lock(&s_pageAllocationLock);
++  auto** link = FindPageAllocation(base_address, base_length);
++  if (!link || (*link)->base != base_address || (*link)->length != base_length) {
++    pthread_mutex_unlock(&s_pageAllocationLock);
++    PA_CHECK(false);
++    return 0;
++  }
++  if (pre_slack) {
++    KrnFreePages(reinterpret_cast<void*>(base_address), pre_slack);
++  }
++  if (post_slack) {
++    KrnFreePages(reinterpret_cast<void*>(result + trim_length), post_slack);
++  }
++  (*link)->base = result;
++  (*link)->length = trim_length;
++  pthread_mutex_unlock(&s_pageAllocationLock);
+   return result;
+ }
+
+@@ -590,11 +380,22 @@
+     PageAccessibilityDisposition) {
+   APTR KernelBase = OpenKernelResource();
+   PA_CHECK(KernelBase);
++  const auto protect = GetPageProtector(KernelBase);
++  pthread_mutex_lock(&s_pageAllocationLock);
++  const bool writable = FindPageAllocation(address, length) &&
++      SetProtection(protect, address, length,
++                    static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
++  if (!writable) {
++    pthread_mutex_unlock(&s_pageAllocationLock);
++    PA_CHECK(writable);
++    return;
++  }
++  std::memset(reinterpret_cast<void*>(address), 0, length);
++  const bool inaccessible = SetProtection(protect, address, length,
++                                          static_cast<KRN_MapAttr>(0));
++  pthread_mutex_unlock(&s_pageAllocationLock);
++  PA_CHECK(inaccessible);
+   TracePageEvent("decommit", address, length, 0);
+-  SetProtection(KernelBase, address, length,
+-                static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
+-  std::memset(reinterpret_cast<void*>(address), 0, length);
+-  SetProtection(KernelBase, address, length, static_cast<KRN_MapAttr>(0));
+ }
+
+ bool DecommitAndZeroSystemPagesInternal(uintptr_t address,
+@@ -605,38 +406,43 @@
+   return true;
+ }
+
++bool TryRecommitSystemPagesInternal(
++    uintptr_t address,
++    size_t length,
++    PageAccessibilityConfiguration accessibility,
++    PageAccessibilityDisposition) {
++  APTR KernelBase = OpenKernelResource();
++  const auto protect = KernelBase ? GetPageProtector(KernelBase) : nullptr;
++  if (!protect) {
++    return false;
++  }
++  pthread_mutex_lock(&s_pageAllocationLock);
++  const bool writable = FindPageAllocation(address, length) &&
++      SetProtection(protect, address, length,
++                    static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
++  if (!writable) {
++    pthread_mutex_unlock(&s_pageAllocationLock);
++    return false;
++  }
++  std::memset(reinterpret_cast<void*>(address), 0, length);
++  const bool accessible = SetProtection(protect, address, length,
++                                        GetAccessFlags(accessibility));
++  pthread_mutex_unlock(&s_pageAllocationLock);
++  return accessible;
++}
++
+ void RecommitSystemPagesInternal(
+     uintptr_t address,
+     size_t length,
+     PageAccessibilityConfiguration accessibility,
+-    PageAccessibilityDisposition) {
+-  APTR KernelBase = OpenKernelResource();
+-  PA_CHECK(KernelBase);
+-  SetProtection(KernelBase, address, length,
+-                static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
+-  std::memset(reinterpret_cast<void*>(address), 0, length);
+-  SetProtection(KernelBase, address, length, GetAccessFlags(accessibility));
+-}
+-
+-bool TryRecommitSystemPagesInternal(
+-    uintptr_t address,
+-    size_t length,
+-    PageAccessibilityConfiguration accessibility,
+-    PageAccessibilityDisposition) {
+-  APTR KernelBase = OpenKernelResource();
+-  if (!KernelBase) {
+-    return false;
+-  }
+-  SetProtection(KernelBase, address, length,
+-                static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
+-  std::memset(reinterpret_cast<void*>(address), 0, length);
+-  SetProtection(KernelBase, address, length, GetAccessFlags(accessibility));
+-  return true;
++    PageAccessibilityDisposition disposition) {
++  PA_CHECK(TryRecommitSystemPagesInternal(address, length, accessibility,
++                                        disposition));
+ }
+
+ void DiscardSystemPagesInternal(uintptr_t, size_t) {
+-  // AROS cannot currently discard physical backing while retaining the
+-  // virtual address reservation. Decommit still zeroes and protects pages.
++  // The current native window eagerly backs its mappings. Discard is a hint;
++  // decommit retains ownership, zeroes memory and removes access instead.
+ }
+
+ }  // namespace partition_alloc::internal
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/page_allocator.cc b/base/allocator/partition_allocator/src/partition_alloc/page_allocator.cc
+--- a/base/allocator/partition_allocator/src/partition_alloc/page_allocator.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/page_allocator.cc
+@@ -95,9 +95,8 @@
+       base_address, base_length, trim_length, accessibility, pre_slack,
+       post_slack);
+ #if BUILDFLAG(IS_AROS)
+-  // The pre-MMU backend retains alignment slack in the owning Exec block and
+-  // releases it with the final trimmed mapping. Keep the logical mapped-space
+-  // counter consistent with the address range visible to PartitionAlloc.
++  // Native trim releases alignment slack directly through KrnFreePages, which
++  // bypasses the public FreePages accounting. Subtract those actual mappings.
+   if (result) {
+     g_total_mapped_address_space.fetch_sub(base_length - trim_length,
+                                            std::memory_order_relaxed);

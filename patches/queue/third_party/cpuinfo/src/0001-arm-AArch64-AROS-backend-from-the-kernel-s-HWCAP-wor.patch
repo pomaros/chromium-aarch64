@@ -1,0 +1,145 @@
+From becaab321fd60bda9bec2b9e3cad3c920e11cf68 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 18:11:23 +0200
+Subject: [PATCH] arm: AArch64 AROS backend from the kernel's HWCAP words
+
+The AROS kernel serves the Linux AT_HWCAP/AT_HWCAP2 words through
+KrnGetSystemAttr(KATTR_HWCap/KATTR_HWCap2), so the Linux AArch64 ISA
+decoder applies unchanged. Topology: one package, one cluster of
+KrnGetCPUCount() cores; AROS does not describe core types or caches.
+---
+ src/arm/aros/init.c        | 98 ++++++++++++++++++++++++++++++++++++++
+ src/cpuinfo/internal-api.h |  1 +
+ src/init.c                 |  2 +
+ 3 files changed, 101 insertions(+)
+ create mode 100644 src/arm/aros/init.c
+
+diff --git a/src/arm/aros/init.c b/src/arm/aros/init.c
+new file mode 100644
+index 0000000..d248f73
+--- /dev/null
++++ b/src/arm/aros/init.c
+@@ -0,0 +1,98 @@
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <cpuinfo.h>
++#include <cpuinfo/internal-api.h>
++#include <cpuinfo/log.h>
++#include <arm/linux/api.h>
++
++#include <aros/aarch64/hwcap.h>
++#include <proto/exec.h>
++#include <proto/kernel.h>
++
++/*
++ * AArch64 AROS. The kernel decodes the ID registers once and serves the
++ * feature words through KrnGetSystemAttr(KATTR_HWCap/KATTR_HWCap2) in the
++ * Linux AT_HWCAP layout, so the Linux decoder applies unchanged. The topology
++ * is one package and one cluster of KrnGetCPUCount() cores; AROS does not
++ * describe the core types or the caches to programs.
++ */
++
++struct cpuinfo_arm_isa cpuinfo_isa;
++
++void cpuinfo_arm_aros_init(void) {
++	APTR kernel = OpenResource((CONST_STRPTR) "kernel.resource");
++	if (kernel == NULL) {
++		cpuinfo_log_error("kernel.resource is not available");
++		return;
++	}
++	intptr_t hwcap = __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap, kernel);
++	intptr_t hwcap2 = __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap2, kernel);
++	const struct cpuinfo_arm_chipset chipset = {
++		.vendor = cpuinfo_arm_chipset_vendor_unknown,
++		.series = cpuinfo_arm_chipset_series_unknown,
++	};
++	cpuinfo_arm64_linux_decode_isa_from_proc_cpuinfo(
++		hwcap == -1 ? 0 : (uint32_t)hwcap, hwcap2 == -1 ? 0 : (uint32_t)hwcap2, 0, &chipset, &cpuinfo_isa);
++
++	uint32_t count = __inline_Kernel_KrnGetCPUCount(kernel);
++	if (count == 0) {
++		count = 1;
++	}
++	struct cpuinfo_processor* processors = calloc(count, sizeof(struct cpuinfo_processor));
++	struct cpuinfo_core* cores = calloc(count, sizeof(struct cpuinfo_core));
++	struct cpuinfo_cluster* cluster = calloc(1, sizeof(struct cpuinfo_cluster));
++	struct cpuinfo_package* package = calloc(1, sizeof(struct cpuinfo_package));
++	struct cpuinfo_uarch_info* uarch = calloc(1, sizeof(struct cpuinfo_uarch_info));
++	if (!processors || !cores || !cluster || !package || !uarch) {
++		cpuinfo_log_error("failed to allocate the CPU topology");
++		free(processors);
++		free(cores);
++		free(cluster);
++		free(package);
++		free(uarch);
++		return;
++	}
++
++	strncpy(package->name, "AArch64", CPUINFO_PACKAGE_NAME_MAX - 1);
++	package->processor_count = count;
++	package->core_count = count;
++	package->cluster_count = 1;
++
++	cluster->processor_count = count;
++	cluster->core_count = count;
++	cluster->package = package;
++	cluster->vendor = cpuinfo_vendor_unknown;
++	cluster->uarch = cpuinfo_uarch_unknown;
++
++	for (uint32_t i = 0; i < count; i++) {
++		cores[i].processor_start = i;
++		cores[i].processor_count = 1;
++		cores[i].core_id = i;
++		cores[i].cluster = cluster;
++		cores[i].package = package;
++		cores[i].vendor = cpuinfo_vendor_unknown;
++		cores[i].uarch = cpuinfo_uarch_unknown;
++		processors[i].core = &cores[i];
++		processors[i].cluster = cluster;
++		processors[i].package = package;
++	}
++
++	uarch->uarch = cpuinfo_uarch_unknown;
++	uarch->processor_count = count;
++	uarch->core_count = count;
++
++	cpuinfo_processors = processors;
++	cpuinfo_cores = cores;
++	cpuinfo_clusters = cluster;
++	cpuinfo_packages = package;
++	cpuinfo_uarchs = uarch;
++	cpuinfo_processors_count = count;
++	cpuinfo_cores_count = count;
++	cpuinfo_clusters_count = 1;
++	cpuinfo_packages_count = 1;
++	cpuinfo_uarchs_count = 1;
++	__sync_synchronize();
++	cpuinfo_is_initialized = true;
++}
+diff --git a/src/cpuinfo/internal-api.h b/src/cpuinfo/internal-api.h
+index d566034..d805809 100644
+--- a/src/cpuinfo/internal-api.h
++++ b/src/cpuinfo/internal-api.h
+@@ -58,6 +58,7 @@ CPUINFO_PRIVATE BOOL CALLBACK cpuinfo_x86_windows_init(PINIT_ONCE init_once, PVO
+ #endif
+ CPUINFO_PRIVATE void cpuinfo_arm_mach_init(void);
+ CPUINFO_PRIVATE void cpuinfo_arm_linux_init(void);
++CPUINFO_PRIVATE void cpuinfo_arm_aros_init(void);
+ CPUINFO_PRIVATE void cpuinfo_riscv_linux_init(void);
+ CPUINFO_PRIVATE void cpuinfo_emscripten_init(void);
+ 
+diff --git a/src/init.c b/src/init.c
+index 1ab9b5a..e2a1b83 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -34,6 +34,8 @@ bool CPUINFO_ABI cpuinfo_initialize(void) {
+ #elif CPUINFO_ARCH_ARM || CPUINFO_ARCH_ARM64
+ #if defined(__linux__)
+ 	pthread_once(&init_guard, &cpuinfo_arm_linux_init);
++#elif defined(__AROS__) && CPUINFO_ARCH_ARM64
++	pthread_once(&init_guard, &cpuinfo_arm_aros_init);
+ #elif defined(__MACH__) && defined(__APPLE__)
+ 	pthread_once(&init_guard, &cpuinfo_arm_mach_init);
+ #elif defined(_WIN32)

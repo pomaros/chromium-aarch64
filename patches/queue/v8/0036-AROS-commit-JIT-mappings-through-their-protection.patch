@@ -1,0 +1,39 @@
+From: John KNIPPER <code@jkn.me>
+Date: Sun, 25 Oct 2026 05:00:00 +0200
+Subject: [PATCH] AROS: commit JIT mappings through their protection
+
+The glue reserves JIT pages with MEMF_RESERVE (core 118b4b2f7b): they have
+no memory until a protection grants access. A MAP_JIT mmap applies its
+protection at creation, and a MAP_FIXED remap of JIT pages (DecommitPages)
+applies its own, which gives the pages back and returns them cleared, the
+fresh mapping POSIX promises. Playing a YouTube video in the PomAROS VM
+takes 74 MB less.
+
+--- a/src/base/platform/platform-posix.cc
++++ b/src/base/platform/platform-posix.cc
+@@ -280,6 +280,11 @@
+       }
+     } else if (!IsArosJitAddress(address)) {
+       memset(address, 0, size);
++    } else if (!ArosJitProtect(address, size, prot)) {
++      // A JIT mapping's pages are given back when made inaccessible and
++      // come back cleared (MEMF_RESERVE): the fresh mapping POSIX promises.
++      errno = ENOMEM;
++      return MAP_FAILED;
+     }
+     return address;
+   }
+@@ -297,6 +302,13 @@
+     raw_size = (size + kPageSize - 1) & ~(kPageSize - 1);
+     raw = ArosJitAlloc(raw_size);
+     if (!raw) {
++      errno = ENOMEM;
++      return MAP_FAILED;
++    }
++    // The pages are reserved, not backed: their protection commits them
++    // (KrnSetProtection), so a mapping made accessible gets it now.
++    if (prot != PROT_NONE && !ArosJitProtect(raw, raw_size, prot)) {
++      ArosJitFree(raw, raw_size);
+       errno = ENOMEM;
+       return MAP_FAILED;
+     }

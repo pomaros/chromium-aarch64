@@ -1,0 +1,30 @@
+From eceb987f1f1e844f2f4313bd01277ee654ea644d Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 02:50:24 +0200
+Subject: [PATCH 691/696] third_party/zlib: keep the ARM SIMD paths off on AROS
+
+zlib's ARM NEON and CRC32 code selects its implementation through a
+runtime CPU-feature probe that knows Linux, Android, Fuchsia, macOS and
+Windows; AROS has none, so the build stops with "Unsupported ARM OS".
+Build the portable code on AArch64 AROS. x64 is unaffected.
+---
+ third_party/zlib/BUILD.gn | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/zlib/BUILD.gn b/third_party/zlib/BUILD.gn
+index 7fff5762e8..6bf278f8ab 100644
+--- a/third_party/zlib/BUILD.gn
++++ b/third_party/zlib/BUILD.gn
+@@ -69,7 +69,8 @@ source_set("zlib_common_headers") {
+ 
+ use_arm_neon_optimizations = false
+ if ((current_cpu == "arm" || current_cpu == "arm64") &&
+-    !(is_win && !is_clang)) {
++    !(is_win && !is_clang) && !is_aros) {
++  # AROS has no runtime CPU-feature probe for the ARMv8 CRC32 path yet.
+   # TODO(richard.townsend@arm.com): Optimizations temporarily disabled for
+   # Windows on Arm MSVC builds, see http://crbug.com/v8/10012.
+   if (arm_use_neon) {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,167 @@
+From 9ff973092933b9de7d8883543ddb6c767af29883 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 02:50:02 +0200
+Subject: [PATCH 690/696] build: add the AArch64 AROS clang toolchain
+
+Add an arm64 toolchain beside the x64 GCC one. AArch64 AROS is built with
+the LLVM toolchain the AROS tree itself uses: clang
+--target=aarch64-unknown-aros, the large code model and no PIC/PIE (AROS
+executables are relocatable ELF objects), linked through collect-aros,
+whose directory aros_tool_dir passes to the driver with -B. aros_clang_root
+names the LLVM directory. The x64 toolchain is unchanged; its
+aros_toolchain_root assertion now applies only when target_cpu is x64.
+
+The arm64 link uses the same -nix startup, pthread archive, allocator
+operator wraps and section script as x64. The clang driver links libc++
+itself, so the libstdc++ ordering of the x64 link is not repeated. The
+section script also folds __lcxx_override, where libc++ places its
+replaceable operator new/delete.
+
+Do not add --target=aarch64-linux-gnu to arm64 clang builds when the
+target OS is AROS.
+
+Tested: the compile flags build standalone V8 12.4.254 (v8_monolith,
+target_os="aros", target_cpu="arm64", cross-built on macOS); a test
+program linked by hand from it with clang, collect-aros and the section
+script runs JavaScript on AArch64 AROS in QEMU and on an Apple M1. The GN
+link line itself (-nix, allocator wraps) has not linked a Chromium target.
+---
+ build/config/BUILDCONFIG.gn               |  3 +-
+ build/config/compiler/BUILD.gn            |  2 +-
+ build/toolchain/aros/BUILD.gn             | 60 ++++++++++++++++++++++-
+ build/toolchain/aros/aros-relocatable.lds |  4 +-
+ 4 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/build/config/BUILDCONFIG.gn b/build/config/BUILDCONFIG.gn
+index c38243c39f..e4cc8d08de 100644
+--- a/build/config/BUILDCONFIG.gn
++++ b/build/config/BUILDCONFIG.gn
+@@ -269,7 +269,8 @@ if (target_os == "android") {
+ } else if (target_os == "zos") {
+   _default_toolchain = "//build/toolchain/zos:$target_cpu"
+ } else if (target_os == "aros") {
+-  assert(target_cpu == "x64", "The initial AROS port supports x64 only.")
++  assert(target_cpu == "x64" || target_cpu == "arm64",
++         "The AROS port supports x64 (GCC) and arm64 (clang).")
+   _default_toolchain = "//build/toolchain/aros:$target_cpu"
+ } else {
+   assert(false, "Unsupported target_os: $target_os")
+diff --git a/build/config/compiler/BUILD.gn b/build/config/compiler/BUILD.gn
+index 3ed383c876..a3b5ddb359 100644
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -1195,7 +1195,7 @@ config("compiler_cpu_abi") {
+         cflags += [ "-mtune=$arm_tune" ]
+       }
+     } else if (current_cpu == "arm64") {
+-      if (is_clang && !is_android && !is_nacl && !is_fuchsia &&
++      if (is_clang && !is_android && !is_nacl && !is_fuchsia && !is_aros &&
+           !(is_chromeos_lacros && is_chromeos_device)) {
+         cflags += [ "--target=aarch64-linux-gnu" ]
+         ldflags += [ "--target=aarch64-linux-gnu" ]
+diff --git a/build/toolchain/aros/BUILD.gn b/build/toolchain/aros/BUILD.gn
+index deb6bcd6f1..d90eefd864 100644
+--- a/build/toolchain/aros/BUILD.gn
++++ b/build/toolchain/aros/BUILD.gn
+@@ -6,8 +6,20 @@ import("//base/allocator/partition_allocator/partition_alloc.gni")
+ import("//build/toolchain/gcc_toolchain.gni")
+ 
+ declare_args() {
++  # x64: directory holding the x86_64-aros-* GCC binaries.
+   aros_toolchain_root = ""
++
++  # AROS SDK root (the directory holding include/ and lib/), passed as
++  # --sysroot.
+   aros_sysroot = ""
++
++  # arm64: directory holding the AROS LLVM toolchain (clang, clang++,
++  # llvm-ar, llvm-nm, llvm-readelf) that knows --target=aarch64-unknown-aros.
++  aros_clang_root = ""
++
++  # arm64: directory holding collect-aros, the AROS link driver the clang
++  # driver runs (an AROS build's bin/<host>/tools).
++  aros_tool_dir = ""
+ }
+ 
+ # The C++ allocation operators, in the order they appear in
+@@ -35,8 +47,16 @@ _cpp_allocation_operators = [
+   "_ZdaPvSt11align_val_tRKSt9nothrow_t",
+ ]
+ 
+-assert(aros_toolchain_root != "",
+-       "Set aros_toolchain_root to the AROS cross-toolchain directory.")
++if (target_cpu == "x64") {
++  assert(aros_toolchain_root != "",
++         "Set aros_toolchain_root to the AROS cross-toolchain directory.")
++}
++if (target_cpu == "arm64") {
++  assert(aros_clang_root != "",
++         "Set aros_clang_root to the AROS LLVM toolchain directory.")
++  assert(aros_tool_dir != "",
++         "Set aros_tool_dir to the directory holding collect-aros.")
++}
+ 
+ _toolprefix = "$aros_toolchain_root/x86_64-aros-"
+ _sysroot_flag = ""
+@@ -93,3 +113,39 @@ gcc_toolchain("x64") {
+     use_sysroot = false
+   }
+ }
++
++# AArch64 AROS is built with the LLVM toolchain the AROS tree itself uses:
++# clang --target=aarch64-unknown-aros, the large code model and no PIC/PIE
++# (AROS executables are relocatable ELF objects, not shared objects), linked
++# through collect-aros. The clang driver adds AROS's POSIX startup for -nix
++# and links libc++ itself, so the libstdc++ ordering of the x64 link does not
++# apply; the allocator wraps and the section script do.
++gcc_toolchain("arm64") {
++  cc = "$aros_clang_root/clang"
++  cxx = "$aros_clang_root/clang++"
++  ar = "$aros_clang_root/llvm-ar"
++  ld = cxx
++  readelf = "$aros_clang_root/llvm-readelf"
++  nm = "$aros_clang_root/llvm-nm"
++
++  _target_flags =
++      "--target=aarch64-unknown-aros -mcmodel=large -fno-pic -fno-pie"
++  # clang 20 makes `x.template f` without an argument list an error; the
++  # pinned third-party code (perfetto) predates that.
++  extra_cppflags = _target_flags + " -fno-omit-frame-pointer" +
++                   " -Wno-missing-template-arg-list-after-template-kw" +
++                   _sysroot_flag
++  extra_ldflags =
++      _target_flags + " -nix -B$aros_tool_dir" + _sysroot_flag +
++      _allocation_operator_wraps + _pthread_archive +
++      " -Wl,--force-group-allocation -Wl,-T${_relocatable_script}"
++
++  toolchain_args = {
++    current_cpu = "arm64"
++    current_os = "aros"
++    is_clang = true
++    use_remoteexec = false
++    use_goma = false
++    use_sysroot = false
++  }
++}
+diff --git a/build/toolchain/aros/aros-relocatable.lds b/build/toolchain/aros/aros-relocatable.lds
+index eeb41bb917..5fc44c750f 100644
+--- a/build/toolchain/aros/aros-relocatable.lds
++++ b/build/toolchain/aros/aros-relocatable.lds
+@@ -7,11 +7,13 @@
+  * Coalesce the ordinary section families at the final relocatable link. Keep
+  * unwind metadata and read-only constants with code so their PC-relative
+  * references are intra-hunk. Writable data remains separate.
++ * __lcxx_override holds libc++'s replaceable operator new/delete in the
++ * clang (arm64) build.
+  */
+ SECTIONS
+ {
+   .text : {
+-    *(.text .text.*)
++    *(.text .text.* __lcxx_override)
+     *(.rodata .rodata.*)
+     *(.eh_frame)
+     *(.gcc_except_table .gcc_except_table.*)
+-- 
+2.50.1 (Apple Git-155)
+

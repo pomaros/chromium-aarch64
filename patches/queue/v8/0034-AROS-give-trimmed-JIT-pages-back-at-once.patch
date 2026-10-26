@@ -1,0 +1,90 @@
+From fe275730c92cdd4f973a34375830ca99aed86fbb Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 23:06:02 +0200
+Subject: [PATCH] AROS: give trimmed JIT pages back at once
+
+OS::Allocate reserves size + alignment - page and munmaps the unaligned
+head and tail. The AROS mmap shim only narrowed a mapping's live range on
+a partial munmap and returned its pages when the whole mapping went, so
+every aligned JIT reservation kept its alignment slack in the kernel's
+executable arena (a 128 KiB code chunk aligned to 256 KiB held 95 pages
+instead of 32).
+
+A JIT mapping now records the arena pages it still holds; a munmap of its
+head or tail frees the whole pages it leaves at once, and the final
+munmap frees what remains, each page once. Ordinary mappings come from
+AllocMem in one piece and are unchanged.
+
+Tested on the host with the shim's own source and a mock arena: trimmed
+reservation, partial pages at both ends, a middle hole; every page is
+returned exactly once.
+---
+ src/base/platform/platform-posix.cc | 30 ++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/base/platform/platform-posix.cc b/src/base/platform/platform-posix.cc
+index d9cc7bc..7af47f1 100644
+--- a/src/base/platform/platform-posix.cc
++++ b/src/base/platform/platform-posix.cc
+@@ -147,6 +147,11 @@ struct ArosMapping {
+   // permissions can change (KrnSetProtection), and the ones a JIT writes
+   // code into. See <aros/apple/jit.h>.
+   bool jit;
++  // The arena pages a JIT mapping still holds. A munmap of its head or
++  // tail (how OS::Allocate trims an aligned reservation) gives the whole
++  // pages it leaves back to the kernel at once, not when the rest goes.
++  uintptr_t held_start;
++  uintptr_t held_end;
+ };
+ 
+ ArosMapping* g_aros_mappings = nullptr;
+@@ -332,6 +337,8 @@ void* ArosMmap(void* address, size_t size, int prot, int flags, int fd,
+   mapping->mapping_size = size;
+   mapping->live_start = mapping_start;
+   mapping->live_end = mapping_start + size;
++  mapping->held_start = mapping_start;
++  mapping->held_end = mapping_start + raw_size;
+   mapping->fd = fd;
+   mapping->offset = offset;
+   mapping->write_back =
+@@ -369,7 +376,25 @@ int ArosMunmap(void* address, size_t size) {
+       }
+ 
+       if (mapping->live_start < mapping->live_end) {
++        uintptr_t head = 0, head_size = 0, tail = 0, tail_size = 0;
++        if (mapping->jit) {
++          constexpr uintptr_t kJitPage = 4096;
++          uintptr_t low = mapping->live_start & ~(kJitPage - 1);
++          uintptr_t high = (mapping->live_end + kJitPage - 1) & ~(kJitPage - 1);
++          if (low > mapping->held_start) {
++            head = mapping->held_start;
++            head_size = low - head;
++            mapping->held_start = low;
++          }
++          if (high < mapping->held_end) {
++            tail = high;
++            tail_size = mapping->held_end - high;
++            mapping->held_end = high;
++          }
++        }
+         UnlockArosMappings();
++        if (head_size) ArosJitFree(reinterpret_cast<void*>(head), head_size);
++        if (tail_size) ArosJitFree(reinterpret_cast<void*>(tail), tail_size);
+         return 0;
+       }
+ 
+@@ -381,7 +406,10 @@ int ArosMunmap(void* address, size_t size) {
+                          mapping->mapping_size, true);
+       }
+       if (mapping->jit) {
+-        ArosJitFree(mapping->raw, mapping->raw_size);
++        if (mapping->held_start < mapping->held_end) {
++          ArosJitFree(reinterpret_cast<void*>(mapping->held_start),
++                      mapping->held_end - mapping->held_start);
++        }
+       } else {
+         FreeMem(mapping->raw, mapping->raw_size);
+       }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,14 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 7fff576..6bf278f 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -69,7 +69,8 @@ source_set("zlib_common_headers") {
+ 
+ use_arm_neon_optimizations = false
+ if ((current_cpu == "arm" || current_cpu == "arm64") &&
+-    !(is_win && !is_clang)) {
++    !(is_win && !is_clang) && !is_aros) {
++  # AROS has no runtime CPU-feature probe for the ARMv8 CRC32 path yet.
+   # TODO(richard.townsend@arm.com): Optimizations temporarily disabled for
+   # Windows on Arm MSVC builds, see http://crbug.com/v8/10012.
+   if (arm_use_neon) {

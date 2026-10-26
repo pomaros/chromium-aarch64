@@ -1,0 +1,88 @@
+From 43c157858466d41747cf599e159c33362f97f4f9 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 23:15:09 +0200
+Subject: [PATCH 701/701] aros: no volume requesters for chrome; a failed file
+ lock leaves the table
+
+chrome probes POSIX paths that AROS does not have (/proc/cpuinfo,
+/proc/self/...); posixc turns "/proc/x" into the volume PROC:, and a
+missing volume opened an "insert volume" requester that froze the browser
+on the M1 until someone answered. main() now sets the process's
+pr_WindowPtr to -1 for its lifetime, so such a probe fails with ENOENT.
+
+FilesystemImpl::LockFileLocal added the path to its lock table before
+taking the fcntl lock and kept it when the lock failed, so every later
+attempt on that path failed as a "lock table collision". It now removes
+the entry on failure. (posixc had no fcntl record locks; core 3bf67545fd
+adds them.)
+---
+ chrome/app/chrome_exe_main_aura.cc            | 27 +++++++++++++++++++
+ .../public/cpp/filesystem/filesystem_impl.cc  |  3 +++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/chrome/app/chrome_exe_main_aura.cc b/chrome/app/chrome_exe_main_aura.cc
+index 9b5a1f19d2..fa3d6e3df6 100644
+--- a/chrome/app/chrome_exe_main_aura.cc
++++ b/chrome/app/chrome_exe_main_aura.cc
+@@ -11,8 +11,10 @@
+ #include <string>
+ #include <vector>
+ 
++#include <dos/dosextens.h>
+ #include <exec/types.h>
+ #include <clib/alib_protos.h>
++#include <proto/exec.h>
+ 
+ #include "chrome/app/aros_v8_heap_owner.h"
+ #endif
+@@ -26,8 +28,33 @@ extern "C" {
+ int ChromeMain(int argc, const char** argv);
+ }
+ 
++#if BUILDFLAG(IS_AROS)
++namespace {
++
++// Chromium probes POSIX paths that do not exist on AROS (/proc/cpuinfo,
++// /proc/self/...). posixc turns "/proc/x" into the volume PROC:, and a
++// missing volume opens an "insert volume" requester that blocks the task
++// until someone answers it. A program probing paths wants ENOENT instead.
++class ScopedNoVolumeRequesters {
++ public:
++  ScopedNoVolumeRequesters()
++      : process_(reinterpret_cast<struct Process*>(FindTask(nullptr))),
++        saved_(process_->pr_WindowPtr) {
++    process_->pr_WindowPtr = reinterpret_cast<APTR>(-1);
++  }
++  ~ScopedNoVolumeRequesters() { process_->pr_WindowPtr = saved_; }
++
++ private:
++  struct Process* const process_;
++  const APTR saved_;
++};
++
++}  // namespace
++#endif
++
+ int main(int argc, const char** argv) {
+ #if BUILDFLAG(IS_AROS)
++  ScopedNoVolumeRequesters no_volume_requesters;
+   ArosRegisterHeapWithV8Library();
+   if (argc == 0) {
+     constexpr char kToolTypePrefix[] = "CHROME_ARG=";
+diff --git a/components/services/storage/public/cpp/filesystem/filesystem_impl.cc b/components/services/storage/public/cpp/filesystem/filesystem_impl.cc
+index dda3c24593..3798b7f322 100644
+--- a/components/services/storage/public/cpp/filesystem/filesystem_impl.cc
++++ b/components/services/storage/public/cpp/filesystem/filesystem_impl.cc
+@@ -288,6 +288,9 @@ base::FileErrorOr<base::File> FilesystemImpl::LockFileLocal(
+     LOG(ERROR) << "[Chromium:AROS:Storage] fcntl lock failed path='"
+                << path.value() << "' error=" << error;
+ #endif
++    // The path is not locked: forget it, or every later attempt would be
++    // refused as a collision with this failed one.
++    GetLockTable().RemoveLock(path);
+     return base::unexpected(error);
+   }
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+

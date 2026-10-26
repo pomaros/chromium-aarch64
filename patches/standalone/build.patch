@@ -1,0 +1,289 @@
+diff --git a/build_config.h b/build_config.h
+index 65a2465..7c9ec1d 100644
+--- a/build_config.h
++++ b/build_config.h
+@@ -75,6 +75,8 @@
+ #else
+ #define OS_MAC 1
+ #endif  // defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++#elif defined(__AROS__)
++#define OS_AROS 1
+ #elif defined(__linux__)
+ #if !defined(OS_CHROMEOS)
+ // Do not define OS_LINUX on Chrome OS build.
+@@ -125,7 +127,8 @@
+ 
+ // For access to standard POSIXish features, use OS_POSIX instead of a
+ // more specific macro.
+-#if defined(OS_AIX) || defined(OS_ANDROID) || defined(OS_ASMJS) ||  \
++#if defined(OS_AIX) || defined(OS_ANDROID) || defined(OS_AROS) ||   \
++    defined(OS_ASMJS) ||                                           \
+     defined(OS_FREEBSD) || defined(OS_IOS) || defined(OS_LINUX) ||  \
+     defined(OS_CHROMEOS) || defined(OS_MAC) || defined(OS_NACL) ||  \
+     defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_QNX) || \
+@@ -146,6 +149,12 @@
+ #define BUILDFLAG_INTERNAL_IS_ANDROID() (0)
+ #endif
+ 
++#if defined(OS_AROS)
++#define BUILDFLAG_INTERNAL_IS_AROS() (1)
++#else
++#define BUILDFLAG_INTERNAL_IS_AROS() (0)
++#endif
++
+ #if defined(OS_APPLE)
+ #define BUILDFLAG_INTERNAL_IS_APPLE() (1)
+ #else
+diff --git a/config/BUILDCONFIG.gn b/config/BUILDCONFIG.gn
+index 1ed842b..f3f2820 100644
+--- a/config/BUILDCONFIG.gn
++++ b/config/BUILDCONFIG.gn
+@@ -268,6 +268,10 @@ if (target_os == "android") {
+   _default_toolchain = "//build/toolchain/aix:$target_cpu"
+ } else if (target_os == "zos") {
+   _default_toolchain = "//build/toolchain/zos:$target_cpu"
++} else if (target_os == "aros") {
++  assert(target_cpu == "x64" || target_cpu == "arm64",
++         "The AROS port supports x64 (GCC) and arm64 (clang).")
++  _default_toolchain = "//build/toolchain/aros:$target_cpu"
+ } else {
+   assert(false, "Unsupported target_os: $target_os")
+ }
+@@ -299,6 +303,7 @@ if (custom_toolchain != "") {
+ # current_os value directly.
+ 
+ is_android = current_os == "android"
++is_aros = current_os == "aros"
+ is_chromeos = current_os == "chromeos"
+ is_fuchsia = current_os == "fuchsia"
+ is_ios = current_os == "ios"
+diff --git a/config/apple/sdk_info.py b/config/apple/sdk_info.py
+index 81b06d4..6f01f62 100755
+--- a/config/apple/sdk_info.py
++++ b/config/apple/sdk_info.py
+@@ -59,11 +59,22 @@ def FillXcodeVersion(settings, developer_dir):
+     settings['xcode_build'] = version_plist['ProductBuildVersion']
+     return
+ 
+-  lines = subprocess.check_output(['xcodebuild',
+-                                   '-version']).decode('UTF-8').splitlines()
+-  settings['xcode_version'] = FormatVersion(lines[0].split()[-1])
++  try:
++    lines = subprocess.check_output(['xcodebuild', '-version'],
++                                    stderr=subprocess.DEVNULL).decode(
++                                        'UTF-8').splitlines()
++    version = lines[0].split()[-1]
++    build = lines[-1].split()[-1]
++  except (subprocess.CalledProcessError, OSError):
++    # A Command Line Tools installation has no xcodebuild. Report the SDK
++    # version as the Xcode version and the running OS build as the build.
++    version = subprocess.check_output(
++        ['xcrun', '--show-sdk-version']).decode('UTF-8').strip()
++    build = subprocess.check_output(
++        ['sw_vers', '-buildVersion']).decode('UTF-8').strip()
++  settings['xcode_version'] = FormatVersion(version)
+   settings['xcode_version_int'] = int(settings['xcode_version'], 10)
+-  settings['xcode_build'] = lines[-1].split()[-1]
++  settings['xcode_build'] = build
+ 
+ 
+ def FillMachineOSBuild(settings):
+diff --git a/config/aros/BUILD.gn b/config/aros/BUILD.gn
+new file mode 100644
+index 0000000..f84fde0
+--- /dev/null
++++ b/config/aros/BUILD.gn
+@@ -0,0 +1,9 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++assert(is_aros)
++
++executable("toolchain_smoke") {
++  sources = [ "toolchain_smoke.cc" ]
++}
+diff --git a/config/aros/toolchain_smoke.cc b/config/aros/toolchain_smoke.cc
+new file mode 100644
+index 0000000..6acabae
+--- /dev/null
++++ b/config/aros/toolchain_smoke.cc
+@@ -0,0 +1,13 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <exec/types.h>
++#include <stdio.h>
++
++int main() {
++  static_assert(sizeof(IPTR) == 8,
++                "The Chromium AROS target requires 64-bit IPTR");
++  puts("Chromium AROS x86-64 toolchain smoke: PASS");
++  return 0;
++}
+diff --git a/config/compiler/BUILD.gn b/config/compiler/BUILD.gn
+index e2d0665..067fd06 100644
+--- a/config/compiler/BUILD.gn
++++ b/config/compiler/BUILD.gn
+@@ -380,7 +380,7 @@ config("compiler") {
+           cflags += [ "-fstack-protector" ]
+         }
+       } else if ((is_posix && !is_chromeos && !is_nacl) || is_fuchsia) {
+-        if (current_os != "aix") {
++        if (current_os != "aix" && !is_aros) {
+           # Not available on aix.
+           cflags += [ "-fstack-protector" ]
+         }
+@@ -641,8 +641,8 @@ config("compiler") {
+ 
+   # C11/C++11 compiler flags setup.
+   # ---------------------------
+-  if (is_linux || is_chromeos || is_android || (is_nacl && is_clang) ||
+-      current_os == "aix") {
++  if (is_linux || is_chromeos || is_android || is_aros ||
++      (is_nacl && is_clang) || current_os == "aix") {
+     if (is_clang) {
+       standard_prefix = "c"
+ 
+@@ -1195,7 +1195,7 @@ config("compiler_cpu_abi") {
+         cflags += [ "-mtune=$arm_tune" ]
+       }
+     } else if (current_cpu == "arm64") {
+-      if (is_clang && !is_android && !is_nacl && !is_fuchsia &&
++      if (is_clang && !is_android && !is_nacl && !is_fuchsia && !is_aros &&
+           !(is_chromeos_lacros && is_chromeos_device)) {
+         cflags += [ "--target=aarch64-linux-gnu" ]
+         ldflags += [ "--target=aarch64-linux-gnu" ]
+@@ -2329,7 +2329,8 @@ if (is_win) {
+         "-Wl,-no_function_starts",
+       ]
+     }
+-  } else if (current_os != "aix" && current_os != "zos") {
++  } else if (current_os != "aix" && current_os != "aros" &&
++             current_os != "zos") {
+     # Non-Mac Posix flags.
+     # Aix does not support these.
+ 
+diff --git a/mac/find_sdk.py b/mac/find_sdk.py
+index 3dcc4d5..98e71ae 100755
+--- a/mac/find_sdk.py
++++ b/mac/find_sdk.py
+@@ -71,6 +71,13 @@ def main():
+   dev_dir = out.decode('UTF-8').rstrip()
+   sdk_dir = os.path.join(
+       dev_dir, 'Platforms/MacOSX.platform/Developer/SDKs')
++  bin_path = 'Toolchains/XcodeDefault.xctoolchain/usr/bin/'
++
++  # A Command Line Tools developer directory keeps its SDKs and binaries at
++  # the top level.
++  if not os.path.isdir(sdk_dir) and os.path.isdir(os.path.join(dev_dir, 'SDKs')):
++    sdk_dir = os.path.join(dev_dir, 'SDKs')
++    bin_path = 'usr/bin/'
+ 
+   if not os.path.isdir(sdk_dir):
+     raise SdkError('Install Xcode, launch it, accept the license ' +
+@@ -90,7 +97,6 @@ def main():
+     print(sdk_path)
+ 
+   if options.print_bin_path:
+-    bin_path = 'Toolchains/XcodeDefault.xctoolchain/usr/bin/'
+     print(os.path.join(dev_dir, bin_path))
+ 
+   if options.print_sdk_build:
+diff --git a/toolchain/aros/BUILD.gn b/toolchain/aros/BUILD.gn
+new file mode 100644
+index 0000000..407fa8d
+--- /dev/null
++++ b/toolchain/aros/BUILD.gn
+@@ -0,0 +1,90 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/toolchain/gcc_toolchain.gni")
++
++declare_args() {
++  # GCC port: directory holding the x86_64-aros-* binaries.
++  aros_toolchain_root = ""
++
++  # Clang port: directory holding clang, clang++, llvm-ar, llvm-nm, llvm-readelf.
++  # The clang driver knows the aarch64-unknown-aros target (startup objects,
++  # the AROS link group, libc++ from the toolchain tree).
++  aros_clang_root = ""
++
++  # AROS SDK root, the directory containing include/ and lib/ (an AROS build's
++  # bin/<arch>/AROS/Developer). Passed as --sysroot.
++  aros_sysroot = ""
++
++  # Directory holding the AROS link driver `collect-aros`; passed as -B so the
++  # clang driver can execute it.
++  aros_tool_dir = ""
++}
++
++_sysroot_flag = ""
++if (aros_sysroot != "") {
++  _sysroot_flag = " --sysroot=$aros_sysroot"
++}
++
++if (target_cpu == "x64") {
++  assert(aros_toolchain_root != "",
++         "Set aros_toolchain_root to the AROS cross-toolchain directory.")
++}
++if (target_cpu == "arm64") {
++  assert(aros_clang_root != "",
++         "Set aros_clang_root to the directory holding the AROS clang.")
++  assert(aros_tool_dir != "",
++         "Set aros_tool_dir to the directory holding collect-aros.")
++}
++
++_toolprefix = "$aros_toolchain_root/x86_64-aros-"
++
++gcc_toolchain("x64") {
++  cc = "${_toolprefix}gcc"
++  cxx = "${_toolprefix}g++"
++  ar = "${_toolprefix}ar"
++  ld = cxx
++  readelf = "${_toolprefix}readelf"
++  nm = "${_toolprefix}nm"
++
++  extra_cppflags =
++      "-m64 -mcmodel=large -mno-red-zone -mno-ms-bitfields" +
++      " -fno-asynchronous-unwind-tables -fno-omit-frame-pointer" + _sysroot_flag
++  extra_ldflags = "-m64 -mcmodel=large" + _sysroot_flag
++
++  toolchain_args = {
++    current_cpu = "x64"
++    current_os = "aros"
++    is_clang = false
++    use_remoteexec = false
++    use_goma = false
++    use_sysroot = false
++  }
++}
++
++# AArch64 AROS is built with the LLVM toolchain the AROS tree itself uses:
++# clang with --target=aarch64-unknown-aros, the large code model, no PIC/PIE
++# (AROS executables are relocatable ELF objects, not shared objects), linked
++# through collect-aros.
++gcc_toolchain("arm64") {
++  cc = "$aros_clang_root/clang"
++  cxx = "$aros_clang_root/clang++"
++  ar = "$aros_clang_root/llvm-ar"
++  ld = cxx
++  readelf = "$aros_clang_root/llvm-readelf"
++  nm = "$aros_clang_root/llvm-nm"
++
++  _target_flags = "--target=aarch64-unknown-aros -mcmodel=large -fno-pic -fno-pie"
++  extra_cppflags = _target_flags + " -fno-omit-frame-pointer" + _sysroot_flag
++  extra_ldflags = _target_flags + " -B$aros_tool_dir" + _sysroot_flag
++
++  toolchain_args = {
++    current_cpu = "arm64"
++    current_os = "aros"
++    is_clang = true
++    use_remoteexec = false
++    use_goma = false
++    use_sysroot = false
++  }
++}

@@ -1,0 +1,40 @@
+From ca97b3301759e7565c06379f02439659988c518b Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 11:50:35 +0200
+Subject: [PATCH 8/9] api: drop lifetimebound from the deprecated
+ Candidate::set_type(string_view)
+
+clang 20 rejects [[clang::lifetimebound]] on a parameter of a function
+that returns void (it would be lifetime_capture_by). The attribute only
+guarded the deprecated string overload.
+---
+ api/candidate.cc | 2 +-
+ api/candidate.h  | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/api/candidate.cc b/api/candidate.cc
+index 930b874..ea228f6 100644
+--- a/api/candidate.cc
++++ b/api/candidate.cc
+@@ -124,7 +124,7 @@ void Candidate::generate_id() {
+   id_ = rtc::CreateRandomString(8);
+ }
+ 
+-void Candidate::set_type(absl::string_view type ABSL_ATTRIBUTE_LIFETIME_BOUND) {
++void Candidate::set_type(absl::string_view type) {
+   set_type(CandidateTypeFromString(type));
+ }
+ 
+diff --git a/api/candidate.h b/api/candidate.h
+index 149da35..ab431a8 100644
+--- a/api/candidate.h
++++ b/api/candidate.h
+@@ -128,7 +128,7 @@ class RTC_EXPORT Candidate {
+   void set_type(webrtc::IceCandidateType type) { type_ = type; }
+ 
+   [[deprecated("Use IceCandidateType version")]] void set_type(
+-      absl::string_view type ABSL_ATTRIBUTE_LIFETIME_BOUND);
++      absl::string_view type);
+ 
+   // Simple checkers for checking the candidate type without dependency on the
+   // IceCandidateType enum. The `is_local()` and `is_stun()` names are legacy

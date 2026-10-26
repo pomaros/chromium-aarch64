@@ -1,0 +1,29 @@
+From fa46516cd6e810955b0909e62624a37836aa8d07 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 16:33:02 +0200
+Subject: [PATCH] AROS: byte swaps through the compiler builtins
+
+AROS has no <byteswap.h>; the clang and GCC builtins give the same
+instructions.
+---
+ src/farmhash.cc | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/farmhash.cc b/src/farmhash.cc
+index cfd4a47..9f96471 100644
+--- a/src/farmhash.cc
++++ b/src/farmhash.cc
+@@ -154,6 +154,13 @@
+ #define bswap_32(x) swap32(x)
+ #define bswap_64(x) swap64(x)
+ 
++#elif defined(__AROS__)
++
++#undef bswap_32
++#undef bswap_64
++#define bswap_32(x) __builtin_bswap32(x)
++#define bswap_64(x) __builtin_bswap64(x)
++
+ #elif defined(__NetBSD__)
+ 
+ #include <sys/types.h>

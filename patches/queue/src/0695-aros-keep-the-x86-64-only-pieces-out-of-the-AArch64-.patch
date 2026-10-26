@@ -1,0 +1,198 @@
+From 2fc59f3f6ec9f81ed8ece5ff176ce6b4ca6a5616 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 04:06:01 +0200
+Subject: [PATCH 695/696] aros: keep the x86-64-only pieces out of the AArch64
+ build
+
+- base: link linuxso and use it for Linux ET_DYN objects only on x86-64.
+  It runs x86-64 Linux objects (the Widevine CDM) against a glibc shim;
+  AArch64 AROS has no such loader, so such an object fails to load with a
+  clear error there.
+- chrome: the posixc descriptor-transfer stub objects of the close-trace
+  experiment are x86-64 objects from one development tree; link them only
+  on x64.
+- ozone: the hand-written eglGetProcAddress stub for SDKs older than
+  egl.library 2.1 is x86-64 assembly; on other architectures require an
+  SDK that defines LVOeglGetProcAddress.
+- navigator.platform and the user agent's platform name say "AROS aarch64"
+  on arm64.
+
+x64 builds are unchanged. Not compiled: these files need a complete
+Chromium tree; the next arm64 Chromium build will be the first to compile
+them.
+---
+ base/BUILD.gn                                 |  7 +++++-
+ base/native_library_aros.cc                   | 22 ++++++++++++++++++-
+ chrome/BUILD.gn                               | 15 ++++++++-----
+ content/common/user_agent.cc                  |  4 ++++
+ .../core/execution_context/navigator_base.cc  |  4 ++++
+ ui/ozone/platform/aros/aros_egl_library.cc    |  4 +++-
+ 6 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/base/BUILD.gn b/base/BUILD.gn
+index 1950dc516f..b351945ba1 100644
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -1173,9 +1173,14 @@ component("base") {
+     # every key destructor at thread exit received the previous key's value.
+     libs += [
+       "debug",
+-      "linuxso",
+       "pthread",
+     ]
++
++    # linuxso runs x86-64 Linux objects against a glibc shim; AArch64 AROS
++    # has no such loader (its dlopen() loads AROS dlmodules).
++    if (current_cpu == "x64") {
++      libs += [ "linuxso" ]
++    }
+   }
+ 
+   if (use_allocator_shim) {
+diff --git a/base/native_library_aros.cc b/base/native_library_aros.cc
+index 92db29e61c..9bfd8012a9 100644
+--- a/base/native_library_aros.cc
++++ b/base/native_library_aros.cc
+@@ -31,8 +31,13 @@
+ // The in-process Linux ET_DYN loader (compiler/linuxso in the AROS tree):
+ // maps the object into exec memory and resolves it against a glibc-ABI
+ // shim, so a Linux shared object such as the Widevine CDM runs on native
+-// AROS where there is no host dynamic linker.
++// AROS where there is no host dynamic linker. It exists for x86-64 only.
++#if defined(__x86_64__)
++#define AROS_HAVE_LINUXSO 1
+ #include <linuxso.h>
++#else
++#define AROS_HAVE_LINUXSO 0
++#endif
+ 
+ namespace base {
+ 
+@@ -356,6 +361,7 @@ NativeLibrary LoadNativeLibraryWithOptions(const FilePath& library_path,
+       ClassifyElfObject(library_path) == ElfObjectType::kDynamic) {
+     APTR HostLibBase = OpenResource("hostlib.resource");
+     if (!HostLibBase || getenv("AROS_LINUXSO")) {
++#if AROS_HAVE_LINUXSO
+       char reason[512] = {};
+       struct LinuxSO* so =
+           linuxso_open(library_path.value().c_str(), reason, sizeof(reason));
+@@ -376,6 +382,14 @@ NativeLibrary LoadNativeLibraryWithOptions(const FilePath& library_path,
+                 << library_path.value() << " loader=linuxso";
+       return WrapArosLibrary(ArosNativeLibraryKind::kLinuxSharedObject,
+                              library_path.BaseName().value(), so);
++#else
++      if (error) {
++        error->message = StrCat({"no loader for Linux shared objects on this "
++                                 "architecture: ",
++                                 library_path.value()});
++      }
++      return nullptr;
++#endif
+     }
+ 
+     std::string host_path;
+@@ -454,7 +468,9 @@ void UnloadNativeLibrary(NativeLibrary library) {
+     if (HostLibBase)
+       HostLib_Close(aros_library->handle, nullptr);
+   } else if (aros_library->kind == ArosNativeLibraryKind::kLinuxSharedObject) {
++#if AROS_HAVE_LINUXSO
+     linuxso_close(static_cast<struct LinuxSO*>(aros_library->handle));
++#endif
+   } else if (aros_library->kind == ArosNativeLibraryKind::kLoadSegModule) {
+     RunLoadSegModuleShutdown(aros_library);
+     UnLoadSeg(reinterpret_cast<BPTR>(aros_library->handle));
+@@ -485,8 +501,12 @@ void* GetFunctionPointerFromNativeLibrary(NativeLibrary library,
+   }
+ 
+   if (aros_library->kind == ArosNativeLibraryKind::kLinuxSharedObject) {
++#if AROS_HAVE_LINUXSO
+     void* result =
+         linuxso_sym(static_cast<struct LinuxSO*>(aros_library->handle), name);
++#else
++    void* result = nullptr;
++#endif
+     LOG(INFO) << "[Chromium:AROS:NativeLibrary] linuxso symbol lookup module="
+               << aros_library->name << " name=" << name << " result=" << result;
+     return result;
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 9c831978c2..22e04854b2 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -1937,11 +1937,14 @@ if (is_aros) {
+     ]
+ 
+     # Experiment only: the posixc 0.41 descriptor-transfer stubs, until the
+-    # AROS SDK this out directory is built against carries them.
+-    ldflags += [
+-      "/home/terminills/Documents/GitHub/aros-adt-websub-x86_64/bin/pc-x86_64-smp/gen/compiler/crt/posixc/posixc/linklib/posixc___posixc_fd_export_stub.o",
+-      "/home/terminills/Documents/GitHub/aros-adt-websub-x86_64/bin/pc-x86_64-smp/gen/compiler/crt/posixc/posixc/linklib/posixc___posixc_fd_import_stub.o",
+-      "/home/terminills/Documents/GitHub/aros-adt-websub-x86_64/bin/pc-x86_64-smp/gen/compiler/crt/posixc/posixc/linklib/posixc___posixc_fd_release_stub.o",
+-    ]
++    # AROS SDK this out directory is built against carries them. They are
++    # x86-64 objects from one development tree.
++    if (current_cpu == "x64") {
++      ldflags += [
++        "/home/terminills/Documents/GitHub/aros-adt-websub-x86_64/bin/pc-x86_64-smp/gen/compiler/crt/posixc/posixc/linklib/posixc___posixc_fd_export_stub.o",
++        "/home/terminills/Documents/GitHub/aros-adt-websub-x86_64/bin/pc-x86_64-smp/gen/compiler/crt/posixc/posixc/linklib/posixc___posixc_fd_import_stub.o",
++        "/home/terminills/Documents/GitHub/aros-adt-websub-x86_64/bin/pc-x86_64-smp/gen/compiler/crt/posixc/posixc/linklib/posixc___posixc_fd_release_stub.o",
++      ]
++    }
+   }
+ }
+diff --git a/content/common/user_agent.cc b/content/common/user_agent.cc
+index d56970128a..8b5a798cbf 100644
+--- a/content/common/user_agent.cc
++++ b/content/common/user_agent.cc
+@@ -89,7 +89,11 @@ std::string GetUnifiedPlatform() {
+     case base::aros::SpoofedPlatform::kNone:
+       break;
+   }
++#if defined(ARCH_CPU_ARM64)
++  return "AROS aarch64";
++#else
+   return "AROS x86_64";
++#endif
+ #elif BUILDFLAG(IS_LINUX)
+   return "X11; Linux x86_64";
+ #elif BUILDFLAG(IS_IOS)
+diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+index 1133e81b1c..f50f5ebf89 100644
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -46,7 +46,11 @@ String GetReducedNavigatorPlatform() {
+     case base::aros::SpoofedPlatform::kNone:
+       break;
+   }
++#if defined(ARCH_CPU_ARM64)
++  return "AROS aarch64";
++#else
+   return "AROS x86_64";
++#endif
+ #elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   return "Linux x86_64";
+ #elif BUILDFLAG(IS_IOS)
+diff --git a/ui/ozone/platform/aros/aros_egl_library.cc b/ui/ozone/platform/aros/aros_egl_library.cc
+index bad85fefca..c7ee2f2c61 100644
+--- a/ui/ozone/platform/aros/aros_egl_library.cc
++++ b/ui/ozone/platform/aros/aros_egl_library.cc
+@@ -78,7 +78,7 @@ void __glAGetProcAddress_GLBase_wrapper();
+ #if defined(LVOeglGetProcAddress)
+ extern "C" void __eglGetProcAddress_EGLBase_wrapper();
+ #define AROS_EGL_GET_PROC_ADDRESS_STUB __eglGetProcAddress_EGLBase_wrapper
+-#else
++#elif defined(__x86_64__)
+ extern "C" void aros_eglGetProcAddress_stub();
+ asm(".text\n"
+     ".globl aros_eglGetProcAddress_stub\n"
+@@ -89,6 +89,8 @@ asm(".text\n"
+     "  jmpq *-544(%r11)\n"  // -68 * sizeof(APTR)
+     ".size aros_eglGetProcAddress_stub, .-aros_eglGetProcAddress_stub\n");
+ #define AROS_EGL_GET_PROC_ADDRESS_STUB aros_eglGetProcAddress_stub
++#else
++#error "Build against an AROS SDK with egl.library 2.1 (LVOeglGetProcAddress)"
+ #endif
+ 
+ namespace ui {
+-- 
+2.50.1 (Apple Git-155)
+

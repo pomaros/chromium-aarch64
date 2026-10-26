@@ -1,0 +1,176 @@
+From: John Knipper <code@jkn.me>
+Subject: [PATCH] aros: preserve native V8 buffer ownership
+
+Use v8.library 1.3 paired byte-buffer API for source chunks and owned
+compile-hints data. Cancellation uses the same resident deleter as V8;
+separate stdc.library bases have distinct pools. Reject missing API.
+
+diff --git a/build/config/aros/v8_library/BUILD.gn b/build/config/aros/v8_library/BUILD.gn
+--- a/build/config/aros/v8_library/BUILD.gn
++++ b/build/config/aros/v8_library/BUILD.gn
+@@ -43,6 +43,7 @@
+ source_set("v8_library_imports") {
+   sources = [
+     "v8_import_resolver.cc",
++    "v8_buffer.h",
+     _generated_imports,
+   ]
+ 
+diff --git a/build/config/aros/v8_library/v8_import_resolver.cc b/build/config/aros/v8_library/v8_import_resolver.cc
+--- a/build/config/aros/v8_library/v8_import_resolver.cc
++++ b/build/config/aros/v8_library/v8_import_resolver.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include <stddef.h>
++#include <stdint.h>
++#include <exec/libraries.h>
++#include <aros/libcall.h>
+ 
+ #include <proto/v8.h>
+ 
+@@ -39,3 +42,32 @@
+   __atomic_store_n(&g_v8_import_slots[index], resolved, __ATOMIC_RELEASE);
+   return resolved;
+ }
++
++// These buffers are later destroyed by V8's own delete[]. Using the browser's
++// stdc base would select a different native memory pool.
++static struct Library* BufferLibrary() {
++  struct Library* base = __aros_getbase_V8Base();
++  if (!base || base->lib_Version < 1 ||
++      (base->lib_Version == 1 && base->lib_Revision < 3) ||
++      base->lib_NegSize < 27 * LIB_VECTSIZE) {
++    ArosKPutStr("[Chromium:shared-v8] v8.library buffer API required\n");
++    __builtin_trap();
++  }
++  return base;
++}
++extern "C" uint8_t* ArosV8AllocateBuffer(size_t size) {
++  struct Library* base = BufferLibrary();
++  void* result = AROS_LC1(APTR, V8AllocateBuffer, AROS_LCA(IPTR, size, D0),
++                         struct Library*, base, 26, V8);
++  if (!result) {
++    ArosKPutStr("[Chromium:shared-v8] buffer allocation failed\n");
++    __builtin_trap();
++  }
++  return static_cast<uint8_t*>(result);
++}
++extern "C" void ArosV8FreeBuffer(void* buffer) {
++  if (!buffer) return;
++  struct Library* base = BufferLibrary();
++  AROS_LC1NR(void, V8FreeBuffer, AROS_LCA(APTR, buffer, A0),
++            struct Library*, base, 27, V8);
++}
+diff --git a/third_party/blink/renderer/bindings/core/v8/script_streamer.cc b/third_party/blink/renderer/bindings/core/v8/script_streamer.cc
+--- a/third_party/blink/renderer/bindings/core/v8/script_streamer.cc
++++ b/third_party/blink/renderer/bindings/core/v8/script_streamer.cc
+@@ -64,24 +64,21 @@
+ #include "third_party/blink/renderer/platform/wtf/text/text_encoding_registry.h"
+ 
+ #if BUILDFLAG(IS_AROS)
+-#include "partition_alloc/shim/allocator_shim_aros_libc.h"
++#include "build/config/aros/v8_library/v8_buffer.h"
+ #endif
+ 
+ namespace blink {
+ namespace {
+ 
+-// Allocates a source chunk whose ownership GetMoreData() passes to V8, which
+-// releases it with delete[]. On AROS Blink and V8 are separate shared
+-// libraries with separate heaps (Blink frees through PartitionAlloc, V8
+-// through stdc.library), so the chunk must come from the heap V8's delete[]
+-// reaches: stdc.library's. Blink can still free such a chunk itself (the
+-// not-handed-over path below): its allocator shim forwards pointers it does not
+-// own to stdc.library. Everywhere else it is a plain new[].
++// Both cancellation and transfer must retain the allocator identity.
++#if BUILDFLAG(IS_AROS)
++using SourceChunk = ArosV8Buffer;
++#else
++using SourceChunk = std::unique_ptr<uint8_t[]>;
++#endif
+ uint8_t* AllocateSourceChunk(size_t size) {
+ #if BUILDFLAG(IS_AROS)
+-  // The V8 scanner requires a valid pointer even for a 0-byte chunk.
+-  return static_cast<uint8_t*>(
+-      allocator_shim::internal::ArosLibcMalloc(size ? size : 1));
++  return ArosV8AllocateBuffer(size);
+ #else
+   return new uint8_t[size];
+ #endif
+@@ -166,7 +163,7 @@
+           CHECK_GT(num_bytes, 0u);
+ 
+           if (src) {
+-            std::unique_ptr<uint8_t[]> copy_for_script_stream(
++            SourceChunk copy_for_script_stream(
+                 AllocateSourceChunk(num_bytes));
+             memcpy(copy_for_script_stream.get(), buffer, num_bytes);
+             *src = copy_for_script_stream.release();
+@@ -339,7 +336,7 @@
+ 
+   // The initial data that was already on the Resource, rather than being read
+   // directly from the data pipe.
+-  std::unique_ptr<uint8_t[]> initial_data_;
++  SourceChunk initial_data_;
+   size_t initial_data_len_ = 0;
+ 
+   mojo::ScopedDataPipeConsumerHandle data_pipe_;
+@@ -1028,7 +1025,7 @@
+     }
+ 
+     size_t size = text_.CharactersSizeInBytes();
+-    std::unique_ptr<uint8_t[]> data_copy(AllocateSourceChunk(size));
++    SourceChunk data_copy(AllocateSourceChunk(size));
+     memcpy(data_copy.get(), text_.Bytes(), size);
+     text_ = String();
+ 
+diff --git a/third_party/blink/renderer/bindings/core/v8/v8_local_compile_hints_producer.cc b/third_party/blink/renderer/bindings/core/v8/v8_local_compile_hints_producer.cc
+--- a/third_party/blink/renderer/bindings/core/v8/v8_local_compile_hints_producer.cc
++++ b/third_party/blink/renderer/bindings/core/v8/v8_local_compile_hints_producer.cc
+@@ -14,6 +14,11 @@
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/script/classic_script.h"
++
++#include "build/build_config.h"
++#if BUILDFLAG(IS_AROS)
++#include "build/config/aros/v8_library/v8_buffer.h"
++#endif
+ 
+ namespace blink::v8_compile_hints {
+ 
+@@ -93,7 +98,11 @@
+   size_t hints_count = compile_hints.size();
+   constexpr size_t prefix_size = sizeof(uint64_t);
+   size_t data_size = hints_count * sizeof(int) + prefix_size;
++#if BUILDFLAG(IS_AROS)
++  ArosV8Buffer data(ArosV8AllocateBuffer(data_size));
++#else
+   std::unique_ptr<uint8_t[]> data(new uint8_t[data_size]);
++#endif
+ 
+   // Add the prefix in a little-endian manner.
+   size_t ix = 0;
+diff --git a/build/config/aros/v8_library/v8_buffer.h b/build/config/aros/v8_library/v8_buffer.h
+new file mode 100644
+--- /dev/null
++++ b/build/config/aros/v8_library/v8_buffer.h
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++#ifndef BUILD_CONFIG_AROS_V8_LIBRARY_V8_BUFFER_H_
++#define BUILD_CONFIG_AROS_V8_LIBRARY_V8_BUFFER_H_
++#include <stddef.h>
++#include <stdint.h>
++#include <memory>
++// Buffers transferred to V8 must use its resident allocator. Keep the paired
++// deleter until ownership is transferred; cancellation must use the same heap.
++extern "C" uint8_t* ArosV8AllocateBuffer(size_t size);
++extern "C" void ArosV8FreeBuffer(void* buffer);
++struct ArosV8BufferDeleter {
++  void operator()(uint8_t* buffer) const { ArosV8FreeBuffer(buffer); }
++};
++using ArosV8Buffer = std::unique_ptr<uint8_t[], ArosV8BufferDeleter>;
++#endif

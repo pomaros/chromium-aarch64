@@ -1,0 +1,38 @@
+From: John KNIPPER <code@jkn.me>
+Date: Sun, 25 Oct 2026 06:30:00 +0200
+Subject: [PATCH] AROS: take the stack start from the task
+
+pthread is a static library on AROS, so v8.library carries its own copy.
+That copy does not know the threads Chromium's copy created: pthread_self()
+returns the main thread's id for them, and pthread_getattr_np() its stack.
+cppgc then scanned the renderer thread's stack up to the main thread's stack
+top, missed the roots on it, and Oilpan swept live objects: a vtable or a
+member read as zero, a ScheduledAction finalised before its DOMTimer let go
+(Check failed: !script_state_), in about one YouTube load in three in the
+PomAROS VM. The task knows its own stack, and StackSwap keeps it current.
+
+--- a/src/base/platform/platform-posix.cc
++++ b/src/base/platform/platform-posix.cc
+@@ -1708,6 +1720,14 @@ bool MainThreadIsCurrentThread() {
+ 
+ // static
+ Stack::StackSlot Stack::ObtainCurrentThreadStackStart() {
++#if V8_OS_AROS
++  // pthread is a static library on AROS: this library's copy does not know
++  // the threads its embedder's copy created, and its pthread_self() names
++  // the main thread for them, so pthread_getattr_np() would return the main
++  // thread's stack and the conservative stack scan would miss every root on
++  // this one. The task knows its own stack; StackSwap keeps it current.
++  return FindTask(nullptr)->tc_SPUpper;
++#else
+   pthread_attr_t attr;
+   int error = pthread_getattr_np(pthread_self(), &attr);
+   if (error) {
+@@ -1737,6 +1757,7 @@ Stack::StackSlot Stack::ObtainCurrentThreadStackStart() {
+   }
+ #endif  // !defined(V8_LIBC_GLIBC)
+   return stack_start;
++#endif  // V8_OS_AROS
+ }
+ 
+ #endif  // !defined(V8_OS_FREEBSD) && !defined(V8_OS_DARWIN) &&

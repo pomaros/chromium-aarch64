@@ -1,0 +1,79 @@
+From: John Knipper <code@jkn.me>
+Subject: [PATCH] aros: preserve preserve_most registers during ARM64 import resolution
+
+cppgc's EnsureGCInfoIndex is preserve_most. Its caller keeps the allocation
+handle in x9, but the lazy import resolver uses ordinary AAPCS64 and may
+clobber x9-x15 before entering the real callee. Preserve that convention's
+additional registers around resolution in the shared V8/Blink emitter.
+
+Retain x0-x8, q0-q7 and caller stack argument placement. The fast path and
+x86-64 generators are unchanged.
+
+diff --git a/build/config/aros/import_trampolines_arm64.py b/build/config/aros/import_trampolines_arm64.py
+--- a/build/config/aros/import_trampolines_arm64.py
++++ b/build/config/aros/import_trampolines_arm64.py
+@@ -6,9 +6,10 @@
+
+ Each import starts as a branch through a writable slot that initially points
+ at the import's slow entry. The slow path preserves every AAPCS64 argument
+-register (x0-x7, the indirect-result register x8, and q0-q7), asks the
+-resolver for the target, caches it in the slot and tail-branches to it, so the
+-first call behaves exactly like later ones. Addresses are materialised with
++register (x0-x7, the indirect-result register x8, and q0-q7), plus
++x9-x15 required by preserve_most exports such as cppgc GC-info registration.
++It asks the resolver for the target, caches it in the slot and tail-branches
++to it, so the first call behaves exactly like later ones. Addresses are materialised with
+ the large-model MOVZ/MOVK relocations: the AROS loader places code and data
+ hunks independently, so no PC-relative reach is assumed between them.
+ """
+@@ -46,30 +47,40 @@
+         f"        .type {slow_path}, @function",
+         f"{slow_path}:",
+         "        // x17 holds the import index (set by the slow entry).",
+-        "        stp x29, x30, [sp, #-224]!",
++        "        stp x29, x30, [sp, #-288]!",
+         "        mov x29, sp",
+         "        stp x0, x1, [sp, #16]",
+         "        stp x2, x3, [sp, #32]",
+         "        stp x4, x5, [sp, #48]",
+         "        stp x6, x7, [sp, #64]",
+         "        str x8, [sp, #80]",
+-        "        stp q0, q1, [sp, #96]",
+-        "        stp q2, q3, [sp, #128]",
+-        "        stp q4, q5, [sp, #160]",
+-        "        stp q6, q7, [sp, #192]",
++        "        // The resolver uses ordinary AAPCS64, but imported preserve_most",
++        "        // functions also promise to retain x9-x15 for their callers.",
++        "        stp x9, x10, [sp, #96]",
++        "        stp x11, x12, [sp, #112]",
++        "        stp x13, x14, [sp, #128]",
++        "        str x15, [sp, #144]",
++        "        stp q0, q1, [sp, #160]",
++        "        stp q2, q3, [sp, #192]",
++        "        stp q4, q5, [sp, #224]",
++        "        stp q6, q7, [sp, #256]",
+         "        mov x0, x17",
+         f"        bl {resolver}",
+         "        mov x16, x0",
+-        "        ldp q6, q7, [sp, #192]",
+-        "        ldp q4, q5, [sp, #160]",
+-        "        ldp q2, q3, [sp, #128]",
+-        "        ldp q0, q1, [sp, #96]",
++        "        ldp q6, q7, [sp, #256]",
++        "        ldp q4, q5, [sp, #224]",
++        "        ldp q2, q3, [sp, #192]",
++        "        ldp q0, q1, [sp, #160]",
++        "        ldr x15, [sp, #144]",
++        "        ldp x13, x14, [sp, #128]",
++        "        ldp x11, x12, [sp, #112]",
++        "        ldp x9, x10, [sp, #96]",
+         "        ldr x8, [sp, #80]",
+         "        ldp x6, x7, [sp, #64]",
+         "        ldp x4, x5, [sp, #48]",
+         "        ldp x2, x3, [sp, #32]",
+         "        ldp x0, x1, [sp, #16]",
+-        "        ldp x29, x30, [sp], #224",
++        "        ldp x29, x30, [sp], #288",
+         "        br x16",
+         f"        .size {slow_path}, .-{slow_path}",
+         "",

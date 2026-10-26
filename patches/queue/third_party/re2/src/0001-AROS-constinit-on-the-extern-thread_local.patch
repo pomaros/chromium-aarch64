@@ -1,0 +1,40 @@
+From 37bb51e1c93b29f65181891ae9fbb9eb9bdce2f7 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 18:17:24 +0200
+Subject: [PATCH] AROS: constinit on the extern thread_local
+
+Without it, every use from another translation unit calls the TLS init
+function through a weak reference, which clang addresses through the GOT
+with -mcmodel=large -fno-pic; the AROS loader has no GOT. The variables
+are constant-initialised already.
+---
+ re2/re2.cc | 2 +-
+ re2/re2.h  | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/re2/re2.cc b/re2/re2.cc
+index 61d9d1f..718d705 100644
+--- a/re2/re2.cc
++++ b/re2/re2.cc
+@@ -1308,7 +1308,7 @@ bool Parse(const char* str, size_t n, unsigned long long* dest, int radix) {
+ namespace hooks {
+ 
+ #ifdef RE2_HAVE_THREAD_LOCAL
+-thread_local const RE2* context = NULL;
++constinit thread_local const RE2* context = NULL;
+ #endif
+ 
+ template <typename T>
+diff --git a/re2/re2.h b/re2/re2.h
+index 7ea44e0..eff0811 100644
+--- a/re2/re2.h
++++ b/re2/re2.h
+@@ -1046,7 +1046,7 @@ namespace hooks {
+ // could result in infinite mutual recursion. To discourage that possibility,
+ // RE2 will not maintain the context pointer correctly when used in that way.
+ #ifdef RE2_HAVE_THREAD_LOCAL
+-extern thread_local const RE2* context;
++extern constinit thread_local const RE2* context;
+ #endif
+ 
+ struct DFAStateCacheReset {

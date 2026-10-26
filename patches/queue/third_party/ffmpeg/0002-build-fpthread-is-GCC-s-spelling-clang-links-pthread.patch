@@ -1,0 +1,29 @@
+From ec4424d14b05001e0964e3b832da94b1a551d7bc Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 13:47:28 +0200
+Subject: [PATCH] build: -fpthread is GCC's spelling; clang links pthread
+ through the AROS link line
+
+The AROS GCC driver takes -fpthread; the AROS LLVM toolchain (the AArch64
+target) rejects it, and its link line adds the pthread archive itself.
+---
+ BUILD.gn | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD.gn b/BUILD.gn
+index 8b1f250..85a1f7d 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -321,7 +321,11 @@ target(link_target_type, "ffmpeg_internal") {
+       "-fno-tree-vectorize",
+     ]
+     if (is_aros) {
+-      cflags += [ "-fpthread" ]
++      # GCC's AROS driver spells it -fpthread; clang links pthread through
++      # the AROS link line.
++      if (!is_clang) {
++        cflags += [ "-fpthread" ]
++      }
+     } else {
+       cflags += [ "-pthread" ]
+     }

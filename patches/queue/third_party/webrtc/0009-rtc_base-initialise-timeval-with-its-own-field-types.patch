@@ -1,0 +1,29 @@
+From 54e515353553de3a7e334b7aa22223b947721d39 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 13:47:28 +0200
+Subject: [PATCH 9/9] rtc_base: initialise timeval with its own field types
+
+The AROS SDK declares tv_sec and tv_usec as unsigned, so the int
+initialisers narrow; cast to the fields' types.
+---
+ rtc_base/task_queue_libevent.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/rtc_base/task_queue_libevent.cc b/rtc_base/task_queue_libevent.cc
+index e27c6ef..5bbef1f 100644
+--- a/rtc_base/task_queue_libevent.cc
++++ b/rtc_base/task_queue_libevent.cc
+@@ -251,8 +251,11 @@ void TaskQueueLibevent::PostDelayedTaskOnTaskQueue(
+   EventAssign(&timer->ev, event_base_, -1, 0, &TaskQueueLibevent::RunTimer,
+               timer);
+   pending_timers_.push_back(timer);
+-  timeval tv = {.tv_sec = rtc::dchecked_cast<int>(delay.us() / 1'000'000),
+-                .tv_usec = rtc::dchecked_cast<int>(delay.us() % 1'000'000)};
++  timeval tv = {
++      .tv_sec = rtc::dchecked_cast<decltype(timeval::tv_sec)>(delay.us() /
++                                                             1'000'000),
++      .tv_usec = rtc::dchecked_cast<decltype(timeval::tv_usec)>(delay.us() %
++                                                               1'000'000)};
+   event_add(&timer->ev, &tv);
+ }
+ 

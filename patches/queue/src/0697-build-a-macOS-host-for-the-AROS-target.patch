@@ -1,0 +1,118 @@
+From 551faf6c538501e0604bdbfcd9996b5458cffebe Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 13:47:31 +0200
+Subject: [PATCH] build: a macOS host for the AROS target
+
+Cross-building the AROS target from macOS: the host toolchain builds the
+generators and other host tools as plain macOS programs, so the AROS
+platform choices in args.gn (Ozone, Aura, the AROS allocator shim and
+PartitionAlloc-as-malloc with its BRP checks) are turned off in the mac
+toolchain's toolchain_args when target_os is "aros". sdk_info.py and
+find_sdk.py fall back to the Command Line Tools SDK when there is no
+Xcode. clang 20, used for host and target, gets
+-Wno-missing-template-arg-list-after-template-kw for the pinned perfetto.
+---
+ build/config/apple/sdk_info.py | 19 +++++++++++++++----
+ build/config/compiler/BUILD.gn |  7 +++++++
+ build/mac/find_sdk.py          |  8 +++++++-
+ build/toolchain/mac/BUILD.gn   | 12 ++++++++++++
+ 4 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/build/config/apple/sdk_info.py b/build/config/apple/sdk_info.py
+index 81b06d438d..6f01f6255a 100755
+--- a/build/config/apple/sdk_info.py
++++ b/build/config/apple/sdk_info.py
+@@ -59,11 +59,22 @@ def FillXcodeVersion(settings, developer_dir):
+     settings['xcode_build'] = version_plist['ProductBuildVersion']
+     return
+ 
+-  lines = subprocess.check_output(['xcodebuild',
+-                                   '-version']).decode('UTF-8').splitlines()
+-  settings['xcode_version'] = FormatVersion(lines[0].split()[-1])
++  try:
++    lines = subprocess.check_output(['xcodebuild', '-version'],
++                                    stderr=subprocess.DEVNULL).decode(
++                                        'UTF-8').splitlines()
++    version = lines[0].split()[-1]
++    build = lines[-1].split()[-1]
++  except (subprocess.CalledProcessError, OSError):
++    # A Command Line Tools installation has no xcodebuild. Report the SDK
++    # version as the Xcode version and the running OS build as the build.
++    version = subprocess.check_output(
++        ['xcrun', '--show-sdk-version']).decode('UTF-8').strip()
++    build = subprocess.check_output(
++        ['sw_vers', '-buildVersion']).decode('UTF-8').strip()
++  settings['xcode_version'] = FormatVersion(version)
+   settings['xcode_version_int'] = int(settings['xcode_version'], 10)
+-  settings['xcode_build'] = lines[-1].split()[-1]
++  settings['xcode_build'] = build
+ 
+ 
+ def FillMachineOSBuild(settings):
+diff --git a/build/config/compiler/BUILD.gn b/build/config/compiler/BUILD.gn
+index a3b5ddb359..3efc157728 100644
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -1741,6 +1741,13 @@ config("treat_warnings_as_errors") {
+ # flags are guaranteed to appear on the compile command line after -Wall.
+ config("default_warnings") {
+   cflags = []
++
++  if (is_clang && target_os == "aros") {
++    # The AROS build uses the AROS LLVM toolchain (clang 20) for both the
++    # target and the host; clang 20 makes `x.template f` without an argument
++    # list an error, and the pinned perfetto predates that.
++    cflags += [ "-Wno-missing-template-arg-list-after-template-kw" ]
++  }
+   cflags_c = []
+   cflags_cc = []
+   ldflags = []
+diff --git a/build/mac/find_sdk.py b/build/mac/find_sdk.py
+index 3dcc4d5d36..98e71aed22 100755
+--- a/build/mac/find_sdk.py
++++ b/build/mac/find_sdk.py
+@@ -71,6 +71,13 @@ def main():
+   dev_dir = out.decode('UTF-8').rstrip()
+   sdk_dir = os.path.join(
+       dev_dir, 'Platforms/MacOSX.platform/Developer/SDKs')
++  bin_path = 'Toolchains/XcodeDefault.xctoolchain/usr/bin/'
++
++  # A Command Line Tools developer directory keeps its SDKs and binaries at
++  # the top level.
++  if not os.path.isdir(sdk_dir) and os.path.isdir(os.path.join(dev_dir, 'SDKs')):
++    sdk_dir = os.path.join(dev_dir, 'SDKs')
++    bin_path = 'usr/bin/'
+ 
+   if not os.path.isdir(sdk_dir):
+     raise SdkError('Install Xcode, launch it, accept the license ' +
+@@ -90,7 +97,6 @@ def main():
+     print(sdk_path)
+ 
+   if options.print_bin_path:
+-    bin_path = 'Toolchains/XcodeDefault.xctoolchain/usr/bin/'
+     print(os.path.join(dev_dir, bin_path))
+ 
+   if options.print_sdk_build:
+diff --git a/build/toolchain/mac/BUILD.gn b/build/toolchain/mac/BUILD.gn
+index ce3a31ad14..cf5718cfa7 100644
+--- a/build/toolchain/mac/BUILD.gn
++++ b/build/toolchain/mac/BUILD.gn
+@@ -22,6 +22,18 @@ template("mac_toolchain") {
+       forward_variables_from(invoker.toolchain_args, "*")
+       current_os = "mac"
+ 
++      if (target_os == "aros") {
++        # A macOS host building the AROS target: the AROS platform choices
++        # in args.gn (Ozone, Aura, the AROS allocator shim) are for the
++        # target; the host tools build as plain macOS programs.
++        use_ozone = false
++        use_aura = false
++        use_allocator_shim = false
++        use_partition_alloc_as_malloc = false
++        enable_backup_ref_ptr_support = false
++        enable_dangling_raw_ptr_checks = false
++      }
++
+       if (target_os == "ios") {
+         # Use LLD for the host part of a chrome/ios build.
+         use_lld = true

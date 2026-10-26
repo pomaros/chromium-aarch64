@@ -1,0 +1,144 @@
+From: John Knipper <code@jkn.me>
+Subject: [PATCH] aros: reserve PartitionAlloc pages without memory
+
+Reserve every range with MEMF_RESERVE (core 118b4b2f7b): KrnSetProtection
+commits what it makes accessible, cleared, and gives back what it makes
+inaccessible. Decommit is then a protection change that returns memory, and
+recommit returns zeroed pages without a memset. The regular pool takes its
+whole cap instead of a share of free RAM. A kernel that ignored MEMF_RESERVE
+would keep stale contents across a decommit, so the first allocation checks
+that a reservation has nothing behind it.
+
+--- a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_aros.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_aros.h
+@@ -30,6 +30,12 @@
+ 
+ extern "C" void ArosKPutStr(const char*) asm("KPutStr");
+ 
++// Address space without memory: KrnSetProtection commits what it makes
++// accessible (cleared) and gives back what it makes inaccessible.
++#ifndef MEMF_RESERVE
++#define MEMF_RESERVE (1L << 14)
++#endif
++
+ namespace partition_alloc::internal {
+ 
+ // KrnAllocPages treats a non-null address as an exact native mapping request.
+@@ -103,6 +109,24 @@
+   return nullptr;
+ }
+ 
++// A kernel that ignores MEMF_RESERVE backs the pages at once: a decommit
++// would then keep their contents and a recommit would not return zeros.
++// Check once that a reservation has nothing behind it.
++void CheckReservationSupport(APTR KernelBase) {
++  (void)KernelBase;  // Used by the native kernel vector call macros.
++  static std::atomic<int> checked{0};
++  if (checked.load(std::memory_order_acquire)) {
++    return;
++  }
++  void* probe = KrnAllocPages(nullptr, PageAllocationGranularity(),
++                              MEMF_PUBLIC | MEMF_RESERVE);
++  PA_CHECK(probe);
++  const bool lazy = KrnVirtualToPhysical(probe) == nullptr;
++  KrnFreePages(probe, PageAllocationGranularity());
++  PA_CHECK(lazy);
++  checked.store(1, std::memory_order_release);
++}
++
+ KRN_PageProtect GetPageProtector(APTR KernelBase) {
+   (void)KernelBase;  // Used by the native kernel vector call macros.
+   const intptr_t operation = KrnGetSystemAttr(KATTR_PageProtect);
+@@ -207,7 +231,10 @@
+     return 0;
+   }
+ 
+-  ULONG flags = MEMF_PUBLIC | MEMF_CLEAR;
++  CheckReservationSupport(KernelBase);
++  // Reserved, not backed: the protection set below commits what is
++  // accessible, cleared.
++  ULONG flags = MEMF_PUBLIC | MEMF_RESERVE;
+   const KRN_MapAttr protection = GetAccessFlags(accessibility);
+   if (accessibility.permissions ==
+           PageAccessibilityConfiguration::kInaccessibleWillJitLater ||
+@@ -381,18 +408,11 @@
+   APTR KernelBase = OpenKernelResource();
+   PA_CHECK(KernelBase);
+   const auto protect = GetPageProtector(KernelBase);
++  // Every range is a reservation: removing access gives its pages back, and
++  // they come back cleared when access is granted again.
+   pthread_mutex_lock(&s_pageAllocationLock);
+-  const bool writable = FindPageAllocation(address, length) &&
+-      SetProtection(protect, address, length,
+-                    static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
+-  if (!writable) {
+-    pthread_mutex_unlock(&s_pageAllocationLock);
+-    PA_CHECK(writable);
+-    return;
+-  }
+-  std::memset(reinterpret_cast<void*>(address), 0, length);
+-  const bool inaccessible = SetProtection(protect, address, length,
+-                                          static_cast<KRN_MapAttr>(0));
++  const bool inaccessible = FindPageAllocation(address, length) &&
++      SetProtection(protect, address, length, static_cast<KRN_MapAttr>(0));
+   pthread_mutex_unlock(&s_pageAllocationLock);
+   PA_CHECK(inaccessible);
+   TracePageEvent("decommit", address, length, 0);
+@@ -416,17 +436,10 @@
+   if (!protect) {
+     return false;
+   }
++  // Pages given back by a decommit are committed again, cleared.
+   pthread_mutex_lock(&s_pageAllocationLock);
+-  const bool writable = FindPageAllocation(address, length) &&
+-      SetProtection(protect, address, length,
+-                    static_cast<KRN_MapAttr>(MAP_Readable | MAP_Writable));
+-  if (!writable) {
+-    pthread_mutex_unlock(&s_pageAllocationLock);
+-    return false;
+-  }
+-  std::memset(reinterpret_cast<void*>(address), 0, length);
+-  const bool accessible = SetProtection(protect, address, length,
+-                                        GetAccessFlags(accessibility));
++  const bool accessible = FindPageAllocation(address, length) &&
++      SetProtection(protect, address, length, GetAccessFlags(accessibility));
+   pthread_mutex_unlock(&s_pageAllocationLock);
+   return accessible;
+ }
+@@ -441,8 +454,8 @@
+ }
+ 
+ void DiscardSystemPagesInternal(uintptr_t, size_t) {
+-  // The current native window eagerly backs its mappings. Discard is a hint;
+-  // decommit retains ownership, zeroes memory and removes access instead.
++  // A hint. Discarded pages stay accessible, and the kernel cannot give an
++  // accessible page back; decommit is what returns memory.
+ }
+ 
+ }  // namespace partition_alloc::internal
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
+@@ -115,7 +115,6 @@
+ // alignment slack immediately. The largest physical block does not limit this
+ // allocation. Cache the size so pool initialization and teardown agree.
+ constexpr size_t kMinRegularPoolSize = kGiB / 8;
+-constexpr size_t kFreeMemoryDivisor = 4;
+ 
+ // Ceiling for a child that is neither a renderer nor the browser: the GPU
+ // process and the utility processes (network, storage, audio, ...) never come
+@@ -187,12 +186,12 @@
+     return cached;
+   }
+ 
++  // The pool is a reservation (MEMF_RESERVE): it costs only the pages that
++  // are committed, so it takes its whole cap rather than a share of free RAM.
+   const IPTR free_bytes = AvailMem(MEMF_PUBLIC);
+   const IPTR largest = AvailMem(MEMF_PUBLIC | MEMF_LARGEST);
+-  const size_t budget = static_cast<size_t>(free_bytes) / kFreeMemoryDivisor;
+-  size_t size = std::bit_floor(budget);
+   const size_t cap = ArosProcessTypePoolCap(max_size);
+-  size = std::clamp(size, kMinRegularPoolSize, cap);
++  const size_t size = std::max(cap, kMinRegularPoolSize);
+ 
+   // Fixed buffer, KPutStr: no allocation inside the allocator.
+   // The process type goes on the same line, so the serial log reads as a

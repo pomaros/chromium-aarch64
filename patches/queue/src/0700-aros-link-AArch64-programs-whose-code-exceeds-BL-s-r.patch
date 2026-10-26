@@ -1,0 +1,431 @@
+From e2cf4ff78f8c17f3152c36a7883667c40534f1bd Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 23:15:08 +0200
+Subject: [PATCH 700/701] aros: link AArch64 programs whose code exceeds BL's
+ reach
+
+The AROS link is ld -r (collect-aros): the loader relocates an ELF object
+in place, and no final layout ever happens, so lld never adds BL
+range-extension veneers. chrome has 355 MiB of code; hundreds of
+thousands of its direct branches reach further than +-128 MiB, and the
+loader refuses them. The arm64 toolchain now links through aros_link.py,
+which runs the usual driver link with a link map and then
+aros_veneers.py: islands of "ldr x16, #8; br x16; .quad target" veneers
+(the target filled by an ABS64 relocation, which the loader applies), one
+near every 64 MiB, and the out-of-reach branches redirected to them.
+
+An island goes only between two input sections that the link map names:
+ld -r resolves no reference between input sections, so every reference
+that crosses an island is a relocation, which the pass adjusts. A
+reference the assembler resolved inside a section (B.cond, CBZ, TBZ,
+LDR literal, ADR, ADRP) never crosses one. The pass finds the
+displacement collect-aros's second link adds in front of the map's
+.text from the symbols both name once, and refuses unless all agree;
+it also refuses a symbol spanning an island and an input section aligned
+beyond a page. Each island starts with a branch over itself. Smaller
+programs are left untouched. AROS_LINK_KEEP_UNVENEERED keeps the link
+before the pass, for an independent check.
+
+The relocatable script also folds malloc_hook (absl's LowLevelAlloc,
+placed there by ABSL_ATTRIBUTE_SECTION) into .text: as its own code hunk
+it was loaded out of its branches' reach.
+
+Checked on the native-TLS chrome: 4 islands, 14 893 veneers; an
+independent decoder of the unveneered link found all 5 842 461 resolved
+PC-relative words of its code moved together with their targets and
+copied unchanged, and every island opening with its branch over.
+---
+ build/toolchain/aros/BUILD.gn             |   6 +-
+ build/toolchain/aros/aros-relocatable.lds |   6 +-
+ build/toolchain/aros/aros_link.py         |  40 +++
+ build/toolchain/aros/aros_veneers.py      | 293 ++++++++++++++++++++++
+ 4 files changed, 342 insertions(+), 3 deletions(-)
+ create mode 100644 build/toolchain/aros/aros_link.py
+ create mode 100644 build/toolchain/aros/aros_veneers.py
+
+diff --git a/build/toolchain/aros/BUILD.gn b/build/toolchain/aros/BUILD.gn
+index d90eefd864..08f327f89c 100644
+--- a/build/toolchain/aros/BUILD.gn
++++ b/build/toolchain/aros/BUILD.gn
+@@ -124,7 +124,11 @@ gcc_toolchain("arm64") {
+   cc = "$aros_clang_root/clang"
+   cxx = "$aros_clang_root/clang++"
+   ar = "$aros_clang_root/llvm-ar"
+-  ld = cxx
++
++  # The AROS link (clang++ drives collect-aros, ld -r) cannot add BL
++  # range-extension veneers; aros_link.py adds them when code exceeds BL's
++  # +-128 MiB reach, which the browser's 355 MiB of code does.
++  ld = "python3 " + rebase_path("aros_link.py", root_build_dir) + " $cxx"
+   readelf = "$aros_clang_root/llvm-readelf"
+   nm = "$aros_clang_root/llvm-nm"
+ 
+diff --git a/build/toolchain/aros/aros-relocatable.lds b/build/toolchain/aros/aros-relocatable.lds
+index 5fc44c750f..5cf671138c 100644
+--- a/build/toolchain/aros/aros-relocatable.lds
++++ b/build/toolchain/aros/aros-relocatable.lds
+@@ -8,12 +8,14 @@
+  * unwind metadata and read-only constants with code so their PC-relative
+  * references are intra-hunk. Writable data remains separate.
+  * __lcxx_override holds libc++'s replaceable operator new/delete in the
+- * clang (arm64) build.
++ * clang (arm64) build; malloc_hook holds absl's LowLevelAlloc functions
++ * (ABSL_ATTRIBUTE_SECTION), which call into .text: a separate code hunk
++ * would be loaded out of their branches' reach.
+  */
+ SECTIONS
+ {
+   .text : {
+-    *(.text .text.* __lcxx_override)
++    *(.text .text.* __lcxx_override malloc_hook)
+     *(.rodata .rodata.*)
+     *(.eh_frame)
+     *(.gcc_except_table .gcc_except_table.*)
+diff --git a/build/toolchain/aros/aros_link.py b/build/toolchain/aros/aros_link.py
+new file mode 100644
+index 0000000000..c4f777734b
+--- /dev/null
++++ b/build/toolchain/aros/aros_link.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++"""The AArch64 AROS link: the AROS driver link, then range-extension veneers.
++
++Usage: aros_link.py CXX ARGS... (the arguments of an ordinary link, -o OUT
++among them). Runs CXX (clang++, which drives collect-aros) with a link map in
++OUT.map, then adds veneers to OUT when branches are out of BL's reach (see
++aros_veneers.py), between the input sections the map names. With
++AROS_LINK_KEEP_UNVENEERED set in the environment, OUT.unveneered keeps the
++link as it was before the pass, for an independent check of the pass.
++"""
++
++import os
++import shutil
++import subprocess
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import aros_veneers  # pylint: disable=wrong-import-position
++
++
++def main(argv):
++    out = argv[argv.index("-o") + 1].strip('"')
++    link_map = out + ".map"
++    result = subprocess.run(argv[1:] + ["-Wl,-Map=" + link_map])
++    if result.returncode:
++        return result.returncode
++    if os.environ.get("AROS_LINK_KEEP_UNVENEERED"):
++        shutil.copyfile(out, out + ".unveneered")
++    summary = aros_veneers.add_veneers(out, link_map)
++    if summary not in ("no veneers needed",):
++        print(f"aros_link: {out}: {summary}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+diff --git a/build/toolchain/aros/aros_veneers.py b/build/toolchain/aros/aros_veneers.py
+new file mode 100644
+index 0000000000..20a259b114
+--- /dev/null
++++ b/build/toolchain/aros/aros_veneers.py
+@@ -0,0 +1,293 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++"""Range-extension veneers for an AArch64 AROS executable.
++
++AROS executables are ELF relocatable objects (ld -r), which the AROS loader
++relocates in place. A linker adds range-extension veneers only when it lays
++out a final image, so an ld -r output whose code exceeds BL's reach (+-128 MiB)
++keeps CALL26/JUMP26 relocations the loader cannot satisfy.
++
++This pass inserts islands of veneers ("ldr x16, #8; br x16; .quad target",
++the target filled by an ABS64 relocation) into .text, only between two input
++sections. The input sections come from the link map (ld.lld -Map) of the
++relocatable link: an ld -r link resolves no reference between input sections,
++so every reference that crosses an island is a relocation, and this pass
++adjusts it. A symbol that would span an island, an input section aligned
++beyond a page or a map that does not match the output refuses the pass. Each
++island starts with a branch over itself, so code never falls into it.
++
++One island goes near every STEP bytes; branches whose target is out of reach
++or in another section are redirected to a veneer in the island nearest to
++them. Every offset into .text (symbol values, relocation offsets,
++section-relative addends) is shifted; islands are page multiples, so
++alignments and page offsets are kept. A file with no such branch is left
++untouched.
++"""
++
++import bisect
++import re
++import struct
++
++R_ABS64, R_CALL26, R_JUMP26 = 257, 283, 282
++REACH = 1 << 27            # +-128 MiB
++MARGIN = 16 << 20          # islands move code; stay well inside the reach
++STEP = 64 << 20
++PAGE = 4096
++SLOT = 16
++VENEER = struct.pack("<II", 0x58000050, 0xD61F0200) + b"\0" * 8
++SH = "<IIQQQQIIQQ"
++MAP_LINE = re.compile(r"^\s*([0-9a-f]+)\s+[0-9a-f]+\s+([0-9a-f]+)\s+(\d+) ( *)(\S.*)$")
++
++
++def fail(msg):
++    raise SystemExit("aros_veneers: " + msg)
++
++
++def read_map(map_path):
++    """The .text input sections and symbols of an ld.lld map.
++
++    Returns (size, [(offset, size, align)], {name: [offsets]})."""
++    size = None
++    inputs, syms = [], {}
++    in_text = False
++    with open(map_path, errors="replace") as f:
++        for line in f:
++            m = MAP_LINE.match(line)
++            if not m:
++                continue
++            vma, sz, align = int(m.group(1), 16), int(m.group(2), 16), int(m.group(3))
++            depth, what = len(m.group(4)), m.group(5)
++            if depth == 0:
++                in_text = what == ".text"
++                if in_text:
++                    if size is not None:
++                        fail("two .text sections in the link map")
++                    size = sz
++            elif not in_text:
++                continue
++            elif depth == 8:
++                inputs.append((vma, sz, align))
++            elif depth == 16 and not what.startswith("$"):
++                syms.setdefault(what, []).append(vma)
++    if size is None or not inputs:
++        fail("no .text input sections in the link map")
++    return size, inputs, syms
++
++
++def add_veneers(path, map_path):
++    """Rewrites PATH in place if it needs veneers; returns a summary line."""
++    data = open(path, "rb").read()
++    shoff, = struct.unpack_from("<Q", data, 0x28)
++    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
++    secs = [list(struct.unpack_from(SH, data, shoff + i * shentsize))
++            for i in range(shnum)]
++    names = secs[shstrndx]
++
++    def secname(s):
++        o = names[4] + s[0]
++        return data[o:data.index(b"\0", o)].decode()
++
++    text = next((i for i, s in enumerate(secs) if secname(s) == ".text"), None)
++    if text is None:
++        return "no .text"
++    symi = next(i for i, s in enumerate(secs) if s[1] == 2)
++    strs = secs[secs[symi][6]]
++    text_size = secs[text][5]
++
++    def symname(st_name):
++        o = strs[4] + st_name
++        return data[o:data.index(b"\0", o)].decode(errors="replace")
++
++    nsym = secs[symi][5] // 24
++    symoff = secs[symi][4]
++    sym_shndx = [0] * nsym
++    sym_value = [0] * nsym
++    text_syms = []
++    text_secsym = None
++    for i in range(nsym):
++        st_name, st_info, _, st_shndx, st_value, st_size = struct.unpack_from(
++            "<IBBHQQ", data, symoff + i * 24)
++        sym_shndx[i], sym_value[i] = st_shndx, st_value
++        if st_shndx == text:
++            if (st_info & 0xF) == 3:
++                text_secsym = i
++            elif st_name:
++                text_syms.append((symname(st_name), st_value, st_size))
++    if text_secsym is None:
++        return "no .text section symbol"
++
++    relsecs = [i for i, s in enumerate(secs) if s[1] == 4]
++
++    # Which branches need a veneer (old layout, with margin).
++    far_sites = []
++    for ri in relsecs:
++        s = secs[ri]
++        for k in range(s[5] // 24):
++            r_off, info, add = struct.unpack_from("<QQq", data, s[4] + k * 24)
++            t = info & 0xFFFFFFFF
++            if t != R_CALL26 and t != R_JUMP26:
++                continue
++            sym = info >> 32
++            if sym_shndx[sym] == 0:
++                continue          # weak undefined: the loader turns it into a NOP
++            if s[7] != text:
++                fail("branch outside .text in " + secname(secs[s[7]]))
++            if (sym_shndx[sym] == text and
++                    abs(sym_value[sym] + add - r_off) < REACH - MARGIN):
++                continue
++            far_sites.append((ri, k, r_off, sym, add))
++    if not far_sites:
++        return "no veneers needed"
++
++    # The map describes the relocatable link; collect-aros's second link may
++    # put sections (.aros.startup) in front of it. Find that displacement from
++    # the symbols both name once, and refuse unless every one agrees.
++    map_size, inputs, map_syms = read_map(map_path)
++    out_count = {}
++    for name, value, _ in text_syms:
++        out_count[name] = out_count.get(name, 0) + 1
++    deltas = set()
++    matched = 0
++    for name, value, _ in text_syms:
++        offs = map_syms.get(name)
++        if out_count[name] == 1 and offs and len(offs) == 1:
++            deltas.add(value - offs[0])
++            matched += 1
++    if len(deltas) != 1 or matched < 2:
++        fail(f"the link map does not match {path} "
++             f"({matched} symbols, displacements {sorted(deltas)[:4]})")
++    delta = deltas.pop()
++    if delta < 0 or delta + map_size != text_size:
++        fail(f"the link map's .text (+{delta}, {map_size} bytes) is not "
++             f"{path}'s ({text_size} bytes)")
++    big = [a for _, _, a in inputs if a > PAGE]
++    if big:
++        fail(f"an input section of .text is aligned to {max(big)} bytes")
++
++    # Insertion points: input section starts, one near every STEP bytes.
++    starts = sorted({delta + vma for vma, sz, _ in inputs if sz and vma})
++    points = []
++    mark = STEP
++    while mark < text_size - STEP // 2:
++        j = bisect.bisect_left(starts, mark)
++        if j < len(starts):
++            points.append(starts[j])
++        mark += STEP
++    points = sorted(set(points))
++    if not points:
++        fail("no insertion point in .text")
++    for name, value, size in text_syms:
++        j = bisect.bisect_right(points, value)
++        if j < len(points) and points[j] < value + size:
++            fail(f"symbol {name} spans the insertion point {points[j]:#x}")
++
++    def nearest_island(off):
++        j = bisect.bisect_left(points, off)
++        cands = [k for k in (j - 1, j) if 0 <= k < len(points)]
++        return min(cands, key=lambda k: abs(points[k] - off))
++
++    # Slot 0 of every island holds the branch over it.
++    per_island = [[] for _ in points]
++    slot = {}
++    far = {}
++    for ri, k, r_off, sym, add in far_sites:
++        isl = nearest_island(r_off)
++        key = (isl, sym, add)
++        if key not in slot:
++            slot[key] = len(per_island[isl]) + 1
++            per_island[isl].append(key)
++        far[(ri, k)] = (isl, key)
++    island_size = [(((len(keys) + 1) * SLOT + PAGE - 1) // PAGE) * PAGE
++                   for keys in per_island]
++    shift_before = []
++    acc = 0
++    for sz in island_size:
++        shift_before.append(acc)
++        acc += sz
++    growth = acc
++
++    def new_off(o):
++        j = bisect.bisect_right(points, o)
++        return o + (shift_before[j - 1] + island_size[j - 1] if j else 0)
++
++    def island_start(isl):
++        return points[isl] + shift_before[isl]
++
++    def target_addend(sym, add):
++        if sym == text_secsym:
++            return new_off(add)
++        if sym_shndx[sym] == text:
++            return new_off(sym_value[sym] + add) - new_off(sym_value[sym])
++        return add
++
++    out_text = bytearray()
++    prev = 0
++    base = secs[text][4]
++    for isl, p in enumerate(points):
++        out_text += data[base + prev:base + p]
++        over = struct.pack("<I", 0x14000000 | (island_size[isl] // 4))
++        out_text += over + b"\0" * (SLOT - len(over))
++        out_text += VENEER * len(per_island[isl])
++        out_text += b"\0" * (island_size[isl] - SLOT * (len(per_island[isl]) + 1))
++        prev = p
++    out_text += data[base + prev:base + text_size]
++
++    veneer_relocs = bytearray()
++    for key, n in slot.items():
++        isl, sym, add = key
++        veneer_relocs += struct.pack(
++            "<QQq", island_start(isl) + n * SLOT + 8, (sym << 32) | R_ABS64,
++            target_addend(sym, add))
++
++    text_rela = next(i for i in relsecs if secs[i][7] == text)
++    new_rela = {}
++    for ri in relsecs:
++        s = secs[ri]
++        out = bytearray(data[s[4]:s[4] + s[5]])
++        for k in range(s[5] // 24):
++            r_off, info, add = struct.unpack_from("<QQq", out, k * 24)
++            sym, t = info >> 32, info & 0xFFFFFFFF
++            if s[7] == text:
++                r_off = new_off(r_off)
++            if (ri, k) in far:
++                isl, key = far[(ri, k)]
++                sym = text_secsym
++                add = island_start(isl) + slot[key] * SLOT
++                info = (sym << 32) | t
++            else:
++                add = target_addend(sym, add)
++            if t in (R_CALL26, R_JUMP26) and sym_shndx[sym] == text:
++                tgt = add if sym == text_secsym else new_off(sym_value[sym]) + add
++                if not -REACH <= tgt - r_off < REACH:
++                    fail("branch still out of reach")
++            struct.pack_into("<QQq", out, k * 24, r_off, info, add)
++        if ri == text_rela:
++            out += veneer_relocs
++        new_rela[ri] = out
++
++    symtab = bytearray(data[symoff:symoff + nsym * 24])
++    for i in range(nsym):
++        if sym_shndx[i] == text and i != text_secsym:
++            struct.pack_into("<Q", symtab, i * 24 + 8, new_off(sym_value[i]))
++
++    contents = {text: bytes(out_text), symi: bytes(symtab)}
++    contents.update({ri: bytes(b) for ri, b in new_rela.items()})
++    result = bytearray(data[:64])
++    for i, s in enumerate(secs):
++        if i == 0 or s[1] == 8:          # NULL, NOBITS
++            continue
++        body = contents.get(i, data[s[4]:s[4] + s[5]])
++        result += b"\0" * ((-len(result)) % max(s[8], 1))
++        s[4] = len(result)
++        s[5] = len(body)
++        result += body
++    result += b"\0" * ((-len(result)) % 8)
++    new_shoff = len(result)
++    for s in secs:
++        result += struct.pack(SH, *s)
++    struct.pack_into("<Q", result, 0x28, new_shoff)
++    open(path, "wb").write(result)
++    return (f"{len(points)} islands, {len(slot)} veneers, {len(far)} branches "
++            f"redirected, .text +{growth} bytes (map displacement {delta})")
+-- 
+2.50.1 (Apple Git-155)
+

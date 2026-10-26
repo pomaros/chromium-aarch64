@@ -1,0 +1,415 @@
+From e55664c907a11cc4b84022ec060e0f3356d21f36 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 03:40:25 +0200
+Subject: [PATCH 33/33] AROS: JIT code pages on AArch64
+
+AArch64 AROS memory is not executable as allocated. The kernel provides
+JIT pages (<aros/apple/jit.h>, reached through v8.library or the
+embedder's glue): on Apple silicon a task switches all its JIT pages
+between r-x and rw- through SPRR, the model of macOS's MAP_JIT and
+pthread_jit_write_protect_np; a virtual-machine guest gets them
+read-write-execute and the switch does nothing; elsewhere the kernel
+refuses them and V8 runs jitless.
+
+V8 takes the macOS heap model on AArch64 AROS:
+
+- V8_HAS_AROS_JIT_WRITE_PROTECT selects a third RwxMemoryWriteScope
+  backend over the kernel switch (__aros_v8_jit_write), with its nesting
+  counter behind an accessor (no extern thread_local, see the AArch64
+  target patch).
+- V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT follows it: the code range is
+  committed read-write-execute once and freed pages are discarded, never
+  re-protected.
+- base::PageAllocator keeps kNoAccessWillJitLater, which it otherwise
+  folds into kNoAccess off macOS, so the code range reservation reaches
+  mmap with MAP_JIT.
+- The mmap shim takes MAP_JIT mappings from the JIT allocator, forwards
+  mprotect on them to the kernel, and never stores into them itself
+  (discard, MAP_FIXED decommit): under SPRR they are writable only inside
+  a write scope. A jittable reservation that the kernel refuses fails
+  instead of falling back to memory the JIT cannot run from.
+
+x64 AROS is unchanged: its memory is executable, no MAP_JIT is requested
+and the glue symbols are not referenced.
+
+Tested in the RWX mode: a test program compiles and runs JavaScript, a
+hot loop and a WebAssembly module with the JIT on, in a virtual-machine
+guest of AArch64 AROS. The SPRR mode has not run V8 yet.
+---
+ src/base/build_config.h             |  10 ++
+ src/base/page-allocator.cc          |   4 +-
+ src/base/platform/platform-posix.cc | 138 ++++++++++++++++++++++++----
+ src/common/code-memory-access-inl.h |  27 ++++++
+ src/common/code-memory-access.cc    |  10 +-
+ src/common/code-memory-access.h     |   9 +-
+ src/common/globals.h                |   4 +-
+ 7 files changed, 179 insertions(+), 23 deletions(-)
+
+diff --git a/src/base/build_config.h b/src/base/build_config.h
+index 9ed4c8f..e5e9e6a 100644
+--- a/src/base/build_config.h
++++ b/src/base/build_config.h
+@@ -41,6 +41,16 @@
+ #define V8_HAS_PKU_JIT_WRITE_PROTECT 0
+ #endif
+ 
++// AArch64 AROS switches a task's JIT pages between writable and executable
++// through the kernel (<aros/apple/jit.h>); the switch is a no-op where the
++// kernel grants read-write-execute pages instead. x86-64 AROS keeps its
++// ordinary memory, which is executable.
++#if defined(V8_OS_AROS) && defined(V8_HOST_ARCH_ARM64)
++#define V8_HAS_AROS_JIT_WRITE_PROTECT 1
++#else
++#define V8_HAS_AROS_JIT_WRITE_PROTECT 0
++#endif
++
+ #if defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_X64)
+ #define V8_TARGET_ARCH_STORES_RETURN_ADDRESS_ON_STACK true
+ #else
+diff --git a/src/base/page-allocator.cc b/src/base/page-allocator.cc
+index 7303c5e..8fff12e 100644
+--- a/src/base/page-allocator.cc
++++ b/src/base/page-allocator.cc
+@@ -44,8 +44,8 @@ void* PageAllocator::GetRandomMmapAddr() {
+ 
+ void* PageAllocator::AllocatePages(void* hint, size_t size, size_t alignment,
+                                    PageAllocator::Permission access) {
+-#if !V8_HAS_PTHREAD_JIT_WRITE_PROTECT
+-  // kNoAccessWillJitLater is only used on Apple Silicon. Map it to regular
++#if !V8_HAS_PTHREAD_JIT_WRITE_PROTECT && !V8_HAS_AROS_JIT_WRITE_PROTECT
++  // kNoAccessWillJitLater is only used on Apple Silicon and AROS. Map it to regular
+   // kNoAccess on other platforms, so code doesn't have to handle both enum
+   // values.
+   if (access == PageAllocator::kNoAccessWillJitLater) {
+diff --git a/src/base/platform/platform-posix.cc b/src/base/platform/platform-posix.cc
+index ab25f93..d9cc7bc 100644
+--- a/src/base/platform/platform-posix.cc
++++ b/src/base/platform/platform-posix.cc
+@@ -95,6 +95,7 @@
+ #define MAP_FIXED 0x10
+ #define MAP_ANONYMOUS 0x20
+ #define MAP_NORESERVE 0x4000
++#define MAP_JIT 0x0800
+ #define MAP_FAILED ((void*)-1)
+ #define MADV_DONTNEED 4
+ #endif
+@@ -142,9 +143,55 @@ struct ArosMapping {
+   int fd;
+   off_t offset;
+   bool write_back;
++  // Pages from the kernel's executable arena: the only ones whose
++  // permissions can change (KrnSetProtection), and the ones a JIT writes
++  // code into. See <aros/apple/jit.h>.
++  bool jit;
+ };
+ 
+ ArosMapping* g_aros_mappings = nullptr;
++
++// JIT code pages, provided by v8.library or the embedder's glue
++// (<aros/apple/jit.h>); V8 never includes the kernel headers. Only AArch64
++// AROS has them: x86-64 AROS memory is executable as allocated.
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++extern "C" void* __aros_v8_jit_alloc(size_t size);
++extern "C" void __aros_v8_jit_free(void* address, size_t size);
++extern "C" int __aros_v8_jit_protect(void* address, size_t size, int read,
++                                     int write, int execute);
++#endif
++
++void* ArosJitAlloc(size_t size) {
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++  return __aros_v8_jit_alloc(size);
++#else
++  USE(size);
++  return nullptr;
++#endif
++}
++
++void ArosJitFree(void* address, size_t size) {
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++  __aros_v8_jit_free(address, size);
++#else
++  USE(address);
++  USE(size);
++#endif
++}
++
++bool ArosJitProtect(void* address, size_t size, int prot) {
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++  return __aros_v8_jit_protect(address, size, (prot & PROT_READ) != 0,
++                               (prot & PROT_WRITE) != 0,
++                               (prot & PROT_EXEC) != 0) != 0;
++#else
++  USE(address);
++  USE(size);
++  USE(prot);
++  return true;
++#endif
++}
++
+ volatile unsigned char g_aros_mappings_lock = 0;
+ 
+ void LockArosMappings() {
+@@ -161,6 +208,25 @@ void UnlockArosMappings() {
+   __atomic_clear(&g_aros_mappings_lock, __ATOMIC_RELEASE);
+ }
+ 
++// Whether an address lies in a JIT mapping. Those pages are executable and,
++// under the SPRR switch, writable only inside a write scope: the shim never
++// stores into them on V8's behalf (discard, decommit).
++bool IsArosJitAddress(const void* address) {
++  uintptr_t start = reinterpret_cast<uintptr_t>(address);
++  bool jit = false;
++  LockArosMappings();
++  for (ArosMapping* mapping = g_aros_mappings; mapping;
++       mapping = mapping->next) {
++    if (start >= mapping->mapping_start &&
++        start < mapping->mapping_start + mapping->mapping_size) {
++      jit = mapping->jit;
++      break;
++    }
++  }
++  UnlockArosMappings();
++  return jit;
++}
++
+ bool TransferArosFile(int fd, off_t offset, void* data, size_t size,
+                       bool write_back) {
+   LockArosMappings();
+@@ -207,7 +273,7 @@ void* ArosMmap(void* address, size_t size, int prot, int flags, int fd,
+       if (!TransferArosFile(fd, offset, address, size, false)) {
+         return MAP_FAILED;
+       }
+-    } else {
++    } else if (!IsArosJitAddress(address)) {
+       memset(address, 0, size);
+     }
+     return address;
+@@ -218,30 +284,48 @@ void* ArosMmap(void* address, size_t size, int prot, int flags, int fd,
+     errno = ENOMEM;
+     return MAP_FAILED;
+   }
+-  size_t raw_size = size + kPageSize - 1;
+-  void* raw = AllocMem(raw_size, MEMF_PUBLIC | MEMF_CLEAR);
+-  if (!raw) {
+-    errno = ENOMEM;
+-    return MAP_FAILED;
++  bool jit = (flags & MAP_JIT) != 0 && fd < 0;
++  size_t raw_size;
++  void* raw;
++  uintptr_t mapping_start;
++  if (jit) {
++    raw_size = (size + kPageSize - 1) & ~(kPageSize - 1);
++    raw = ArosJitAlloc(raw_size);
++    if (!raw) {
++      errno = ENOMEM;
++      return MAP_FAILED;
++    }
++    mapping_start = reinterpret_cast<uintptr_t>(raw);
++  } else {
++    raw_size = size + kPageSize - 1;
++    raw = AllocMem(raw_size, MEMF_PUBLIC | MEMF_CLEAR);
++    if (!raw) {
++      errno = ENOMEM;
++      return MAP_FAILED;
++    }
++    mapping_start = (reinterpret_cast<uintptr_t>(raw) + kPageSize - 1) &
++                    ~(static_cast<uintptr_t>(kPageSize) - 1);
+   }
+-  uintptr_t mapping_start =
+-      (reinterpret_cast<uintptr_t>(raw) + kPageSize - 1) &
+-      ~(static_cast<uintptr_t>(kPageSize) - 1);
+ 
+   if (fd >= 0 &&
+       !TransferArosFile(fd, offset, reinterpret_cast<void*>(mapping_start),
+                         size, false)) {
+-    FreeMem(raw, raw_size);
++    FreeMem(raw, raw_size);  // never a JIT mapping: those take no file
+     return MAP_FAILED;
+   }
+ 
+   auto* mapping = static_cast<ArosMapping*>(
+       AllocMem(sizeof(ArosMapping), MEMF_PUBLIC | MEMF_CLEAR));
+   if (!mapping) {
+-    FreeMem(raw, raw_size);
++    if (jit) {
++      ArosJitFree(raw, raw_size);
++    } else {
++      FreeMem(raw, raw_size);
++    }
+     errno = ENOMEM;
+     return MAP_FAILED;
+   }
++  mapping->jit = jit;
+   mapping->raw = raw;
+   mapping->raw_size = raw_size;
+   mapping->mapping_start = mapping_start;
+@@ -296,7 +380,11 @@ int ArosMunmap(void* address, size_t size) {
+                          reinterpret_cast<void*>(mapping->mapping_start),
+                          mapping->mapping_size, true);
+       }
+-      FreeMem(mapping->raw, mapping->raw_size);
++      if (mapping->jit) {
++        ArosJitFree(mapping->raw, mapping->raw_size);
++      } else {
++        FreeMem(mapping->raw, mapping->raw_size);
++      }
+       FreeMem(mapping, sizeof(ArosMapping));
+       return 0;
+     }
+@@ -307,14 +395,22 @@ int ArosMunmap(void* address, size_t size) {
+ }
+ 
+ int ArosMprotect(void* address, size_t size, int prot) {
+-  USE(address);
+-  USE(size);
+-  USE(prot);
++  // Only JIT mappings have changeable permissions; the rest of V8's memory
++  // is ordinary read-write RAM whatever it asks for.
++  bool jit = IsArosJitAddress(address);
++  if (!jit || size == 0) return 0;
++  // Writable and executable together is the JIT permission: executable,
++  // and writable while the task has switched to writing.
++  if (!ArosJitProtect(address, size, prot)) {
++    errno = EACCES;
++    return -1;
++  }
+   return 0;
+ }
+ 
+ int ArosMadvise(void* address, size_t size, int advice) {
+-  if (advice == MADV_DONTNEED || advice == MADV_FREE) {
++  if ((advice == MADV_DONTNEED || advice == MADV_FREE) &&
++      !IsArosJitAddress(address)) {
+     memset(address, 0, size);
+   }
+   return 0;
+@@ -368,15 +464,16 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access,
+     flags |= MAP_LAZY;
+ #endif  // V8_OS_QNX
+   }
+-#if V8_OS_DARWIN
++#if V8_OS_DARWIN || V8_HAS_AROS_JIT_WRITE_PROTECT
+   // MAP_JIT is required to obtain writable and executable pages when the
+   // hardened runtime/memory protection is enabled, which is optional (via code
+   // signing) on Intel-based Macs but mandatory on Apple silicon ones. See also
+   // https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon.
++  // On AROS it selects the kernel's executable page arena.
+   if (access == OS::MemoryPermission::kNoAccessWillJitLater) {
+     flags |= MAP_JIT;
+   }
+-#endif  // V8_OS_DARWIN
++#endif  // V8_OS_DARWIN || V8_HAS_AROS_JIT_WRITE_PROTECT
+   return flags;
+ }
+ 
+@@ -857,6 +954,11 @@ Optional<AddressSpaceReservation> OS::CreateAddressSpaceReservation(
+   }
+ 
+   void* reservation = Allocate(hint, size, alignment, permission);
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++  // Ordinary AArch64 AROS memory is never executable: a jittable reservation
++  // that fails must fail, not fall back to pages the JIT cannot run from.
++  if (!reservation) return {};
++#endif
+   if (!reservation && permission == MemoryPermission::kNoAccessWillJitLater) {
+     // Retry without MAP_JIT, for example in case we are running on an old OS X.
+     permission = MemoryPermission::kNoAccess;
+diff --git a/src/common/code-memory-access-inl.h b/src/common/code-memory-access-inl.h
+index e1ec30c..a4e1dae 100644
+--- a/src/common/code-memory-access-inl.h
++++ b/src/common/code-memory-access-inl.h
+@@ -272,6 +272,33 @@ void RwxMemoryWriteScope::SetExecutable() {
+   }
+ }
+ 
++#elif V8_HAS_AROS_JIT_WRITE_PROTECT
++
++// Provided by v8.library or the embedder's glue: the kernel switch of
++// <aros/apple/jit.h>. Returns UINT64_MAX when the kernel has no JIT pages.
++extern "C" uint64_t __aros_v8_jit_write(int writable);
++
++// static
++bool RwxMemoryWriteScope::IsSupported() { return true; }
++
++// static
++void RwxMemoryWriteScope::SetWritable() {
++  int* level = nesting_level();
++  if (*level == 0) {
++    __aros_v8_jit_write(1);
++  }
++  ++*level;
++}
++
++// static
++void RwxMemoryWriteScope::SetExecutable() {
++  int* level = nesting_level();
++  --*level;
++  if (*level == 0) {
++    __aros_v8_jit_write(0);
++  }
++}
++
+ #else  // !V8_HAS_PTHREAD_JIT_WRITE_PROTECT && !V8_TRY_USE_PKU_JIT_WRITE_PROTECT
+ 
+ // static
+diff --git a/src/common/code-memory-access.cc b/src/common/code-memory-access.cc
+index 94328a1..e7a0e02 100644
+--- a/src/common/code-memory-access.cc
++++ b/src/common/code-memory-access.cc
+@@ -10,7 +10,15 @@ namespace internal {
+ 
+ ThreadIsolation::TrustedData ThreadIsolation::trusted_data_;
+ 
+-#if V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_PKU_JIT_WRITE_PROTECT
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++namespace {
++thread_local int aros_code_space_write_nesting_level = 0;
++}  // namespace
++// static
++int* RwxMemoryWriteScope::nesting_level() {
++  return &aros_code_space_write_nesting_level;
++}
++#elif V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_PKU_JIT_WRITE_PROTECT
+ thread_local int RwxMemoryWriteScope::code_space_write_nesting_level_ = 0;
+ #endif  // V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_PKU_JIT_WRITE_PROTECT
+ 
+diff --git a/src/common/code-memory-access.h b/src/common/code-memory-access.h
+index 80d96bb..0737cc7 100644
+--- a/src/common/code-memory-access.h
++++ b/src/common/code-memory-access.h
+@@ -124,9 +124,16 @@ class V8_NODISCARD RwxMemoryWriteScope {
+   V8_INLINE static void SetWritable();
+   V8_INLINE static void SetExecutable();
+ 
+-#if V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_PKU_JIT_WRITE_PROTECT
++#if V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_PKU_JIT_WRITE_PROTECT || \
++    V8_HAS_AROS_JIT_WRITE_PROTECT
+   // This counter is used for supporting scope reentrance.
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++  // Reached only through the two accessors below: the AROS loader rejects
++  // the GOT relocations clang emits for an extern thread_local.
++  static int* nesting_level();
++#else
+   V8_EXPORT_PRIVATE static thread_local int code_space_write_nesting_level_;
++#endif
+ #endif  // V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_PKU_JIT_WRITE_PROTECT
+ };
+ 
+diff --git a/src/common/globals.h b/src/common/globals.h
+index 00e855c..5ac239a 100644
+--- a/src/common/globals.h
++++ b/src/common/globals.h
+@@ -271,7 +271,9 @@ const size_t kShortBuiltinCallsOldSpaceSizeThreshold = size_t{2} * GB;
+ //    deleted while the cage is still alive then attempt to configure
+ //    permissions of pages that were previously set to RWX will fail.
+ //
+-#if V8_HAS_PTHREAD_JIT_WRITE_PROTECT && \
++// AROS follows the same model: MAP_JIT selects the kernel's JIT pages and
++// the per-task switch of <aros/apple/jit.h> plays pthread_jit_write_protect.
++#if (V8_HAS_PTHREAD_JIT_WRITE_PROTECT || V8_HAS_AROS_JIT_WRITE_PROTECT) && \
+     !(defined(V8_COMPRESS_POINTERS) && !defined(V8_EXTERNAL_CODE_SPACE))
+ #define V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT true
+ #else
+-- 
+2.50.1 (Apple Git-155)
+

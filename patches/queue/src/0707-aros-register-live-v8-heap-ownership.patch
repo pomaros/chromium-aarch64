@@ -1,0 +1,188 @@
+From: John Knipper <code@jkn.me>
+Subject: [PATCH] aros: register live V8 heap ownership
+
+Register a predicate before pools exist, covering all active PA pools.
+Fail explicitly if V8 cannot route foreign allocations back to Chromium.
+
+diff --git a/chrome/app/aros_v8_heap_owner.cc b/chrome/app/aros_v8_heap_owner.cc
+--- a/chrome/app/aros_v8_heap_owner.cc
++++ b/chrome/app/aros_v8_heap_owner.cc
+@@ -1,139 +1,62 @@
+ // Copyright 2026 The Chromium Authors
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+-
+ #include "chrome/app/aros_v8_heap_owner.h"
+-
+-#include <stddef.h>
+ #include <stdint.h>
+-#include <stdio.h>
+ #include <stdlib.h>
+-
+ #include <aros/libcall.h>
+ #include <exec/libraries.h>
+ #include <proto/exec.h>
+-
+ #include "partition_alloc/partition_alloc_buildflags.h"
+-
+-#if !BUILDFLAG(HAS_64_BIT_POINTERS)
++#if BUILDFLAG(HAS_64_BIT_POINTERS)
++#include "partition_alloc/partition_address_space.h"
++#else
+ #include "partition_alloc/address_pool_manager_bitmap.h"
+ #endif
+-
+ extern "C" void ArosKPutStr(const char*) asm("KPutStr");
++namespace {
++struct Library* g_v8_base = nullptr;
++bool g_registered = false;
++void FreeToChromiumHeap(void* ptr) { free(ptr); }
++BOOL OwnedByChromiumHeap(void* ptr) {
+ #if BUILDFLAG(HAS_64_BIT_POINTERS)
+-extern "C" uintptr_t ArosPartitionAllocRegularPoolBase();
+-extern "C" size_t ArosPartitionAllocRegularPoolSize();
++  if (!partition_alloc::internal::PartitionAddressSpace::IsInitialized())
++    return FALSE;
+ #endif
+-
+-namespace {
+-
+-struct Library* g_v8_base = nullptr;
+-uintptr_t g_registered_base = 0;
+-
+-void FreeToChromiumHeap(void* ptr) {
+-  free(ptr);
++  return partition_alloc::IsManagedByPartitionAlloc(
++             reinterpret_cast<uintptr_t>(ptr)) ? TRUE : FALSE;
+ }
+-
+-BOOL V8OwnerRangeAdd(struct Library* V8Base, APTR base, IPTR size, APTR fn) {
+-  return AROS_LC3(BOOL, V8OwnerRangeAdd, AROS_LCA(APTR, base, A0),
+-                  AROS_LCA(IPTR, size, D0), AROS_LCA(APTR, fn, A1),
+-                  struct Library*, V8Base, 22, V8);
++BOOL AddOwnerCheck(struct Library* base) {
++  return AROS_LC2(BOOL, V8OwnerCheckAdd,
++      AROS_LCA(APTR, reinterpret_cast<APTR>(&OwnedByChromiumHeap), A0),
++      AROS_LCA(APTR, reinterpret_cast<APTR>(&FreeToChromiumHeap), A1),
++      struct Library*, base, 24, V8);
+ }
+-
+-BOOL V8OwnerRangeRemove(struct Library* V8Base, APTR base) {
+-  return AROS_LC1(BOOL, V8OwnerRangeRemove, AROS_LCA(APTR, base, A0),
+-                  struct Library*, V8Base, 23, V8);
++void RemoveOwnerCheck(struct Library* base) {
++  AROS_LC1(BOOL, V8OwnerCheckRemove,
++      AROS_LCA(APTR, reinterpret_cast<APTR>(&OwnedByChromiumHeap), A0),
++      struct Library*, base, 25, V8);
+ }
+-
+-#if !BUILDFLAG(HAS_64_BIT_POINTERS)
+-bool g_registered_check = false;
+-
+-// PartitionAlloc reserves super pages wherever AROS has room: there is no
+-// pool range to register, so v8.library asks this instead.
+-BOOL OwnedByChromiumHeap(void* ptr) {
+-  return partition_alloc::IsManagedByPartitionAlloc(
+-             reinterpret_cast<uintptr_t>(ptr))
+-             ? TRUE
+-             : FALSE;
++}  // namespace
++void ArosRegisterHeapWithV8Library() {
++  if (g_registered) return;
++  g_v8_base = OpenLibrary("v8.library", 1);
++  if (!g_v8_base || g_v8_base->lib_NegSize < 25 * LIB_VECTSIZE ||
++      !AddOwnerCheck(g_v8_base)) {
++    ArosKPutStr("[Chromium:AROS] V8 heap ownership registration failed\n");
++    if (g_v8_base) CloseLibrary(g_v8_base);
++    g_v8_base = nullptr;
++    __builtin_trap();
++  }
++  // Register the query, not a snapshot of a pool which may not exist yet.
++  // It also covers PA's BRP/configurable pools when those are enabled.
++  g_registered = true;
++  ArosKPutStr("[Chromium:AROS] v8.library owner check registered\n");
+ }
+-
+-BOOL V8OwnerCheckAdd(struct Library* V8Base, APTR owns, APTR fn) {
+-  return AROS_LC2(BOOL, V8OwnerCheckAdd, AROS_LCA(APTR, owns, A0),
+-                  AROS_LCA(APTR, fn, A1), struct Library*, V8Base, 24, V8);
+-}
+-
+-BOOL V8OwnerCheckRemove(struct Library* V8Base, APTR owns) {
+-  return AROS_LC1(BOOL, V8OwnerCheckRemove, AROS_LCA(APTR, owns, A0),
+-                  struct Library*, V8Base, 25, V8);
+-}
+-#endif
+-
+-}  // namespace
+-
+-void ArosRegisterHeapWithV8Library() {
+-#if BUILDFLAG(HAS_64_BIT_POINTERS)
+-  const uintptr_t base = ArosPartitionAllocRegularPoolBase();
+-  const size_t size = ArosPartitionAllocRegularPoolSize();
+-  char line[160];
+-
+-  if (!base || !size) {
+-    return;
+-  }
+-  g_v8_base = OpenLibrary("v8.library", 0);
+-  if (!g_v8_base) {
+-    return;
+-  }
+-  if (g_v8_base->lib_Version < 1 || g_v8_base->lib_NegSize < 23 * LIB_VECTSIZE) {
+-    ArosKPutStr("[Chromium:AROS] v8.library has no owner ranges\n");
+-    CloseLibrary(g_v8_base);
+-    g_v8_base = nullptr;
+-    return;
+-  }
+-  if (V8OwnerRangeAdd(g_v8_base, reinterpret_cast<APTR>(base), size,
+-                      reinterpret_cast<APTR>(&FreeToChromiumHeap))) {
+-    g_registered_base = base;
+-  }
+-  snprintf(line, sizeof(line),
+-           "[Chromium:AROS] v8.library owner range %p+%zu %s\n",
+-           reinterpret_cast<void*>(base), size,
+-           g_registered_base ? "registered" : "REFUSED");
+-  ArosKPutStr(line);
+-#else
+-  g_v8_base = OpenLibrary("v8.library", 0);
+-  if (!g_v8_base) {
+-    return;
+-  }
+-  if (g_v8_base->lib_Version < 1 || g_v8_base->lib_NegSize < 25 * LIB_VECTSIZE) {
+-    // Blink buffers that V8 deletes would reach v8.library's own allocator.
+-    ArosKPutStr("[Chromium:AROS] v8.library has no owner checks: "
+-                "update v8.library (1.2 or later)\n");
+-    CloseLibrary(g_v8_base);
+-    g_v8_base = nullptr;
+-    return;
+-  }
+-  g_registered_check =
+-      V8OwnerCheckAdd(g_v8_base, reinterpret_cast<APTR>(&OwnedByChromiumHeap),
+-                      reinterpret_cast<APTR>(&FreeToChromiumHeap));
+-  ArosKPutStr(g_registered_check
+-                  ? "[Chromium:AROS] v8.library owner check registered\n"
+-                  : "[Chromium:AROS] v8.library owner check REFUSED\n");
+-#endif
+-}
+-
+ void ArosUnregisterHeapFromV8Library() {
+-  if (!g_v8_base) {
+-    return;
+-  }
+-  if (g_registered_base) {
+-    V8OwnerRangeRemove(g_v8_base, reinterpret_cast<APTR>(g_registered_base));
+-    g_registered_base = 0;
+-  }
+-#if !BUILDFLAG(HAS_64_BIT_POINTERS)
+-  if (g_registered_check) {
+-    V8OwnerCheckRemove(g_v8_base, reinterpret_cast<APTR>(&OwnedByChromiumHeap));
+-    g_registered_check = false;
+-  }
+-#endif
++  if (!g_v8_base) return;
++  if (g_registered) RemoveOwnerCheck(g_v8_base);
++  g_registered = false;
+   CloseLibrary(g_v8_base);
+   g_v8_base = nullptr;
+ }

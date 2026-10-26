@@ -1,0 +1,224 @@
+From e87013a1a97347d34c6aae7a7bd08bf11635ffeb Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Thu, 22 Oct 2026 20:10:13 +0200
+Subject: [PATCH 32/33] AROS: AArch64 target support
+
+Reach the two extern thread_local variables (g_current_isolate_, the trap
+handler's g_thread_in_wasm_code) through out-of-line accessors in their
+defining unit when clang builds for AROS: clang addresses an extern
+thread_local through the GOT and the AROS loader rejects GOT relocations.
+The GCC x64 build keeps the inline accesses.
+
+Spin with yield on AArch64 in the mapping lock. Undefine AROS's STACKED
+attribute macro before the arm64 regexp assembler's enum that uses the
+name.
+
+Tested: v8_monolith for target_cpu="arm64" with clang 20
+(aarch64-unknown-aros); a test program runs JavaScript (jitless) on
+AArch64 AROS in QEMU and on an Apple M1.
+---
+ src/base/platform/platform-posix.cc           |  4 ++++
+ src/execution/isolate-inl.h                   |  2 ++
+ src/execution/isolate.cc                      | 10 ++++++++++
+ src/execution/isolate.h                       | 12 +++++++++++
+ .../arm64/regexp-macro-assembler-arm64.h      |  6 ++++++
+ src/trap-handler/handler-outside.cc           |  2 ++
+ src/trap-handler/handler-shared.cc            | 20 +++++++++++++++++++
+ src/trap-handler/trap-handler.h               | 11 +++++++++-
+ 8 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/src/base/platform/platform-posix.cc b/src/base/platform/platform-posix.cc
+index 98c8c3d..ab25f93 100644
+--- a/src/base/platform/platform-posix.cc
++++ b/src/base/platform/platform-posix.cc
+@@ -149,7 +149,11 @@ volatile unsigned char g_aros_mappings_lock = 0;
+ 
+ void LockArosMappings() {
+   while (__atomic_test_and_set(&g_aros_mappings_lock, __ATOMIC_ACQUIRE)) {
++#if defined(__x86_64__) || defined(__i386__)
+     __asm__ __volatile__("pause");
++#elif defined(__aarch64__)
++    __asm__ __volatile__("yield");
++#endif
+   }
+ }
+ 
+diff --git a/src/execution/isolate-inl.h b/src/execution/isolate-inl.h
+index 256db29..140b5f8 100644
+--- a/src/execution/isolate-inl.h
++++ b/src/execution/isolate-inl.h
+@@ -23,6 +23,7 @@
+ namespace v8 {
+ namespace internal {
+ 
++#if !(defined(__AROS__) && defined(__clang__))
+ // static
+ V8_INLINE Isolate::PerIsolateThreadData*
+ Isolate::CurrentPerIsolateThreadData() {
+@@ -31,6 +32,7 @@ Isolate::CurrentPerIsolateThreadData() {
+ 
+ // static
+ V8_INLINE Isolate* Isolate::TryGetCurrent() { return g_current_isolate_; }
++#endif
+ 
+ // static
+ V8_INLINE Isolate* Isolate::Current() {
+diff --git a/src/execution/isolate.cc b/src/execution/isolate.cc
+index b646cb8..f5daf4a 100644
+--- a/src/execution/isolate.cc
++++ b/src/execution/isolate.cc
+@@ -498,6 +498,16 @@ thread_local Isolate::PerIsolateThreadData* g_current_per_isolate_thread_data_
+     V8_CONSTINIT = nullptr;
+ thread_local Isolate* g_current_isolate_ V8_CONSTINIT = nullptr;
+ 
++#if defined(__AROS__) && defined(__clang__)
++// static
++Isolate::PerIsolateThreadData* Isolate::CurrentPerIsolateThreadData() {
++  return g_current_per_isolate_thread_data_;
++}
++
++// static
++Isolate* Isolate::TryGetCurrent() { return g_current_isolate_; }
++#endif
++
+ namespace {
+ // A global counter for all generated Isolates, might overflow.
+ std::atomic<int> isolate_counter{0};
+diff --git a/src/execution/isolate.h b/src/execution/isolate.h
+index 8f40fe7..86eb330 100644
+--- a/src/execution/isolate.h
++++ b/src/execution/isolate.h
+@@ -645,10 +645,20 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+ 
+   // Returns the PerIsolateThreadData for the current thread (or nullptr if one
+   // is not currently set).
++#if defined(__AROS__) && defined(__clang__)
++  static PerIsolateThreadData* CurrentPerIsolateThreadData();
++#else
+   V8_INLINE static PerIsolateThreadData* CurrentPerIsolateThreadData();
++#endif
+ 
+   // Returns the isolate inside which the current thread is running or nullptr.
++#if defined(__AROS__) && defined(__clang__)
++  // The AROS loader rejects GOT relocations, and clang reaches an extern
++  // thread_local through the GOT. Keep the accesses in isolate.cc.
++  static Isolate* TryGetCurrent();
++#else
+   V8_INLINE static Isolate* TryGetCurrent();
++#endif
+ 
+   // Returns the isolate inside which the current thread is running.
+   V8_INLINE static Isolate* Current();
+@@ -2719,9 +2729,11 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+ // These are outside the Isolate class with extern storage because in clang-cl,
+ // thread_local is incompatible with dllexport linkage caused by
+ // V8_EXPORT_PRIVATE being applied to Isolate.
++#if !(defined(__AROS__) && defined(__clang__))
+ extern thread_local Isolate::PerIsolateThreadData*
+     g_current_per_isolate_thread_data_ V8_CONSTINIT;
+ extern thread_local Isolate* g_current_isolate_ V8_CONSTINIT;
++#endif
+ 
+ #undef FIELD_ACCESSOR
+ #undef THREAD_LOCAL_TOP_ACCESSOR
+diff --git a/src/regexp/arm64/regexp-macro-assembler-arm64.h b/src/regexp/arm64/regexp-macro-assembler-arm64.h
+index 18524a8..1059df7 100644
+--- a/src/regexp/arm64/regexp-macro-assembler-arm64.h
++++ b/src/regexp/arm64/regexp-macro-assembler-arm64.h
+@@ -10,6 +10,12 @@
+ #include "src/codegen/macro-assembler.h"
+ #include "src/regexp/regexp-macro-assembler.h"
+ 
++#if defined(__AROS__) && defined(STACKED)
++// AROS's <aros/aarch64/cpu.h>, reached through the libc type headers, defines
++// STACKED as a parameter attribute. This header uses the name as an enum value.
++#undef STACKED
++#endif
++
+ namespace v8 {
+ namespace internal {
+ 
+diff --git a/src/trap-handler/handler-outside.cc b/src/trap-handler/handler-outside.cc
+index 22ede82..6e79ab4 100644
+--- a/src/trap-handler/handler-outside.cc
++++ b/src/trap-handler/handler-outside.cc
+@@ -231,7 +231,9 @@ void ReleaseHandlerData(int index) {
+   free(data);
+ }
+ 
++#if !(defined(__AROS__) && defined(__clang__))
+ int* GetThreadInWasmThreadLocalAddress() { return &g_thread_in_wasm_code; }
++#endif
+ 
+ size_t GetRecoveredTrapCount() {
+   return gRecoveredTrapCount.load(std::memory_order_relaxed);
+diff --git a/src/trap-handler/handler-shared.cc b/src/trap-handler/handler-shared.cc
+index 1c6c25c..afa4896 100644
+--- a/src/trap-handler/handler-shared.cc
++++ b/src/trap-handler/handler-shared.cc
+@@ -28,6 +28,26 @@ namespace trap_handler {
+ // 1 byte in size; see https://sourceware.org/bugzilla/show_bug.cgi?id=14898.
+ thread_local int g_thread_in_wasm_code;
+ 
++#if defined(__AROS__) && defined(__clang__)
++int* GetThreadInWasmThreadLocalAddress() { return &g_thread_in_wasm_code; }
++
++bool IsThreadInWasm() { return g_thread_in_wasm_code; }
++
++void SetThreadInWasm() {
++  if (IsTrapHandlerEnabled()) {
++    TH_DCHECK(!IsThreadInWasm());
++    g_thread_in_wasm_code = true;
++  }
++}
++
++void ClearThreadInWasm() {
++  if (IsTrapHandlerEnabled()) {
++    TH_DCHECK(IsThreadInWasm());
++    g_thread_in_wasm_code = false;
++  }
++}
++#endif
++
+ static_assert(sizeof(g_thread_in_wasm_code) > 1,
+               "sizeof(thread_local_var) must be > 1, see "
+               "https://sourceware.org/bugzilla/show_bug.cgi?id=14898");
+diff --git a/src/trap-handler/trap-handler.h b/src/trap-handler/trap-handler.h
+index 4bf95b8..5aa677a 100644
+--- a/src/trap-handler/trap-handler.h
++++ b/src/trap-handler/trap-handler.h
+@@ -147,7 +147,10 @@ inline bool IsTrapHandlerEnabled() {
+   return g_is_trap_handler_enabled;
+ }
+ 
+-#if defined(V8_OS_AIX)
++#if defined(__AROS__) && defined(__clang__)
++// The AROS loader rejects GOT relocations, and clang reaches an extern
++// thread_local through the GOT. handler-shared.cc owns every access.
++#elif defined(V8_OS_AIX)
+ // `thread_local` does not link on AIX:
+ // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=100641
+ extern __thread int g_thread_in_wasm_code;
+@@ -163,6 +166,11 @@ V8_NOINLINE TH_EXPORT_PRIVATE int* GetThreadInWasmThreadLocalAddress();
+ // On Windows, asan installs its own exception handler which maps shadow
+ // memory. Since our exception handler may be executed before the asan exception
+ // handler, we have to make sure that asan shadow memory is not accessed here.
++#if defined(__AROS__) && defined(__clang__)
++TH_EXPORT_PRIVATE bool IsThreadInWasm();
++TH_EXPORT_PRIVATE void SetThreadInWasm();
++TH_EXPORT_PRIVATE void ClearThreadInWasm();
++#else
+ TH_DISABLE_ASAN inline bool IsThreadInWasm() { return g_thread_in_wasm_code; }
+ 
+ inline void SetThreadInWasm() {
+@@ -178,6 +186,7 @@ inline void ClearThreadInWasm() {
+     g_thread_in_wasm_code = false;
+   }
+ }
++#endif
+ 
+ bool RegisterDefaultTrapHandler();
+ TH_EXPORT_PRIVATE void RemoveTrapHandler();
+-- 
+2.50.1 (Apple Git-155)
+

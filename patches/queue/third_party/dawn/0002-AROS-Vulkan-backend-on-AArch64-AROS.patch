@@ -1,0 +1,243 @@
+From e4184dfc7a5fab186678b5108d31ca4a3aea59c5 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 04:33:00 +0200
+Subject: [PATCH] AROS: Vulkan backend on AArch64 AROS
+
+- DynamicLib: load through dlopen() where the AROS SDK has <dlfcn.h>
+  (posixc dlopen() loads AROS dlmodules); keep failing closed where it
+  does not.
+- Vulkan backend: the AROS loader is libvulkan.so.1, found by dlopen() in
+  PROGDIR: or LIBS:dl/; it reaches the drivers through vulkan.hidd.
+- System events: AROS pipes cannot be polled for readiness (posixc has no
+  poll(), select() is a stub, the pipe handler does not answer
+  WaitForChar), so a sender and its receiver share an atomic flag and a
+  timed wait-any looks at the flags, sleeping 1 ms between looks.
+- Standalone AROS builds use Dawn's own raw_ptr fallback instead of
+  Chromium's PartitionAlloc, whose AROS port lives in the Chromium queue.
+
+Tested: dawn_native, dawn_proc, webgpu_cpp and a probe program build and
+link for aarch64-unknown-aros (no GOT relocations). Not yet run against a
+Vulkan driver.
+---
+ build_overrides/dawn.gni             |  6 +++++-
+ src/dawn/common/DynamicLib.cpp       | 11 +++++++----
+ src/dawn/native/SystemEvent.cpp      | 23 ++++++++++++++++++++---
+ src/dawn/native/SystemEvent.h        |  9 +++++++++
+ src/dawn/native/WaitAnySystemEvent.h | 27 +++++++++++++++++++++++++++
+ src/dawn/native/vulkan/BackendVk.cpp |  4 ++++
+ 6 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/build_overrides/dawn.gni b/build_overrides/dawn.gni
+index 79e39111..a5ea75e3 100644
+--- a/build_overrides/dawn.gni
++++ b/build_overrides/dawn.gni
+@@ -56,7 +56,11 @@ dawn_dxheaders_dir = "//third_party/dxheaders"
+ # PartitionAlloc is an optional dependency.
+ # It does not fully support the MSVC compiler at the moment.
+ if (is_clang || !is_win) {
+-  dawn_partition_alloc_dir = "//third_party/partition_alloc/"
++  # Standalone AROS builds use Dawn's own raw_ptr fallback: Chromium's
++  # PartitionAlloc port lives in the Chromium queue, not in this checkout.
++  if (!is_aros) {
++    dawn_partition_alloc_dir = "//third_party/partition_alloc/"
++  }
+ }
+ 
+ # Optional path to a one-liner version file. Default is empty path indicating
+diff --git a/src/dawn/common/DynamicLib.cpp b/src/dawn/common/DynamicLib.cpp
+index 4c6a913a..c2753710 100644
+--- a/src/dawn/common/DynamicLib.cpp
++++ b/src/dawn/common/DynamicLib.cpp
+@@ -36,9 +36,12 @@
+ #if DAWN_PLATFORM_IS(WINUWP)
+ #include "dawn/common/WindowsUtils.h"
+ #endif
+-#elif DAWN_PLATFORM_IS(AROS)
++#elif DAWN_PLATFORM_IS(AROS) && !__has_include(<dlfcn.h>)
+ // AROS libraries are not POSIX shared objects and have no dlfcn interface.
++#define DAWN_AROS_NO_DLFCN 1
+ #elif DAWN_PLATFORM_IS(POSIX)
++// On AROS with a posixc dlopen(), the modules are AROS dlmodules (LoadSeg
++// objects with an export table) loaded through the same interface.
+ #include <dlfcn.h>
+ #else
+ #error "Unsupported platform for DynamicLib"
+@@ -73,7 +76,7 @@ bool DynamicLib::Open(const std::string& filename, std::string* error) {
+     if (mHandle == nullptr && error != nullptr) {
+         *error = "Windows Error: " + std::to_string(GetLastError());
+     }
+-#elif DAWN_PLATFORM_IS(AROS)
++#elif defined(DAWN_AROS_NO_DLFCN)
+     if (error != nullptr) {
+         *error = "Dynamic library loading is unavailable on AROS.";
+     }
+@@ -97,7 +100,7 @@ void DynamicLib::Close() {
+ 
+ #if DAWN_PLATFORM_IS(WINDOWS)
+     FreeLibrary(static_cast<HMODULE>(mHandle));
+-#elif DAWN_PLATFORM_IS(AROS)
++#elif defined(DAWN_AROS_NO_DLFCN)
+     // Open() cannot produce a handle on AROS.
+ #elif DAWN_PLATFORM_IS(POSIX)
+     dlclose(mHandle);
+@@ -117,7 +120,7 @@ void* DynamicLib::GetProc(const std::string& procName, std::string* error) const
+     if (proc == nullptr && error != nullptr) {
+         *error = "Windows Error: " + std::to_string(GetLastError());
+     }
+-#elif DAWN_PLATFORM_IS(AROS)
++#elif defined(DAWN_AROS_NO_DLFCN)
+     if (error != nullptr) {
+         *error = "Dynamic symbol lookup is unavailable on AROS.";
+     }
+diff --git a/src/dawn/native/SystemEvent.cpp b/src/dawn/native/SystemEvent.cpp
+index 6d2a3a6c..6c5a7d00 100644
+--- a/src/dawn/native/SystemEvent.cpp
++++ b/src/dawn/native/SystemEvent.cpp
+@@ -31,6 +31,8 @@
+ 
+ #if DAWN_PLATFORM_IS(WINDOWS)
+ #include <windows.h>
++#elif DAWN_PLATFORM_IS(AROS)
++#include <unistd.h>
+ #elif DAWN_PLATFORM_IS(POSIX)
+ #include <sys/poll.h>
+ #include <unistd.h>
+@@ -62,16 +64,24 @@ SystemEventReceiver SystemEventReceiver::CreateAlreadySignaled() {
+ SystemEventPipeSender::~SystemEventPipeSender() {
+     // Make sure it's been Signaled (or is empty) before being dropped.
+     // Dropping this would "leak" the receiver (it'll never get signalled).
+-    DAWN_ASSERT(!mPrimitive.IsValid());
++    DAWN_ASSERT(!IsValid());
+ }
+ 
+ bool SystemEventPipeSender::IsValid() const {
++#if DAWN_PLATFORM_IS(AROS)
++    return mFlag != nullptr;
++#else
+     return mPrimitive.IsValid();
++#endif
+ }
+ 
+ void SystemEventPipeSender::Signal() && {
+-    DAWN_ASSERT(mPrimitive.IsValid());
+-#if DAWN_PLATFORM_IS(WINDOWS)
++    DAWN_ASSERT(IsValid());
++#if DAWN_PLATFORM_IS(AROS)
++    mFlag->store(true, std::memory_order_release);
++    mFlag.reset();
++    return;
++#elif DAWN_PLATFORM_IS(WINDOWS)
+     DAWN_CHECK(SetEvent(mPrimitive.Get()));
+ #elif DAWN_PLATFORM_IS(POSIX)
+     // Send one byte to signal the receiver
+@@ -102,6 +112,13 @@ std::pair<SystemEventPipeSender, SystemEventReceiver> CreateSystemEventPipe() {
+     SystemEventPipeSender sender;
+     sender.mPrimitive = SystemHandle::Acquire(eventDup);
+ 
++    return std::make_pair(std::move(sender), std::move(receiver));
++#elif DAWN_PLATFORM_IS(AROS)
++    auto flag = std::make_shared<std::atomic<bool>>(false);
++    SystemEventReceiver receiver;
++    receiver.mFlag = flag;
++    SystemEventPipeSender sender;
++    sender.mFlag = std::move(flag);
+     return std::make_pair(std::move(sender), std::move(receiver));
+ #elif DAWN_PLATFORM_IS(POSIX)
+     int pipeFds[2];
+diff --git a/src/dawn/native/SystemEvent.h b/src/dawn/native/SystemEvent.h
+index 9e75f64d..26925c86 100644
+--- a/src/dawn/native/SystemEvent.h
++++ b/src/dawn/native/SystemEvent.h
+@@ -28,6 +28,8 @@
+ #ifndef SRC_DAWN_NATIVE_SYSTEMEVENT_H_
+ #define SRC_DAWN_NATIVE_SYSTEMEVENT_H_
+ 
++#include <atomic>
++#include <memory>
+ #include <optional>
+ #include <utility>
+ 
+@@ -64,6 +66,10 @@ class SystemEventReceiver final : NonCopyable {
+     friend bool WaitAnySystemEvent(It begin, It end, Nanoseconds timeout);
+     friend std::pair<SystemEventPipeSender, SystemEventReceiver> CreateSystemEventPipe();
+     SystemHandle mPrimitive;
++#if DAWN_PLATFORM_IS(AROS)
++    // AROS pipes cannot be polled for readiness: the pair shares a flag.
++    std::shared_ptr<std::atomic<bool>> mFlag;
++#endif
+ };
+ 
+ // See CreateSystemEventPipe.
+@@ -80,6 +86,9 @@ class SystemEventPipeSender final : NonCopyable {
+   private:
+     friend std::pair<SystemEventPipeSender, SystemEventReceiver> CreateSystemEventPipe();
+     SystemHandle mPrimitive;
++#if DAWN_PLATFORM_IS(AROS)
++    std::shared_ptr<std::atomic<bool>> mFlag;
++#endif
+ };
+ 
+ // CreateSystemEventPipe provides an SystemEventReceiver that can be signalled by Dawn code. This is
+diff --git a/src/dawn/native/WaitAnySystemEvent.h b/src/dawn/native/WaitAnySystemEvent.h
+index 0e2336a8..298da1f5 100644
+--- a/src/dawn/native/WaitAnySystemEvent.h
++++ b/src/dawn/native/WaitAnySystemEvent.h
+@@ -35,6 +35,9 @@
+ 
+ #if DAWN_PLATFORM_IS(WINDOWS)
+ #include "dawn/common/windows_with_undefs.h"
++#elif DAWN_PLATFORM_IS(AROS)
++#include <chrono>
++#include <thread>
+ #elif DAWN_PLATFORM_IS(POSIX)
+ #include <sys/poll.h>
+ #include <unistd.h>
+@@ -91,6 +94,30 @@ template <typename It>
+ 
+     *(*(begin + completedIndex)).second = true;
+     return true;
++#elif DAWN_PLATFORM_IS(AROS)
++    // No fd readiness on AROS: look at the shared flags until one is set or
++    // the timeout passes, sleeping a millisecond between looks.
++    using Clock = std::chrono::steady_clock;
++    const uint64_t ns = uint64_t{timeout};
++    const bool forever = ns > uint64_t{1} << 62;
++    const Clock::time_point deadline =
++        forever ? Clock::time_point::max() : Clock::now() + std::chrono::nanoseconds(ns);
++    for (;;) {
++        bool any = false;
++        for (auto it = begin; it != end; ++it) {
++            const auto& flag = (*it).first.mFlag;
++            bool ready = flag != nullptr && flag->load(std::memory_order_acquire);
++            *(*it).second = ready;
++            any |= ready;
++        }
++        if (any) {
++            return true;
++        }
++        if (Clock::now() >= deadline) {
++            return false;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
+ #elif DAWN_PLATFORM_IS(POSIX)
+     StackVector<pollfd, 4 /* avoid heap allocation for small waits */> pollfds;
+     pollfds->reserve(count);
+diff --git a/src/dawn/native/vulkan/BackendVk.cpp b/src/dawn/native/vulkan/BackendVk.cpp
+index 4dd35970..180abc53 100644
+--- a/src/dawn/native/vulkan/BackendVk.cpp
++++ b/src/dawn/native/vulkan/BackendVk.cpp
+@@ -67,6 +67,10 @@ constexpr char kVulkanLibName[] = "vulkan-1.dll";
+ constexpr char kVulkanLibName[] = "libvulkan.dylib";
+ #elif DAWN_PLATFORM_IS(FUCHSIA)
+ constexpr char kVulkanLibName[] = "libvulkan.so";
++#elif DAWN_PLATFORM_IS(AROS)
++// The AROS Vulkan loader, an AROS dlmodule found by dlopen() in PROGDIR: or
++// LIBS:dl/; it reaches the drivers through vulkan.hidd.
++constexpr char kVulkanLibName[] = "libvulkan.so.1";
+ #else
+ #error "Unimplemented Vulkan backend platform"
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+

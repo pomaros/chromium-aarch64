@@ -1,0 +1,50 @@
+From f41f65eef8ec8cd22f29aadf6aadaa7b4b0920c5 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Sat, 24 Oct 2026 00:01:37 +0200
+Subject: [PATCH] aros: no Chromium thread above Exec priority 1
+
+The port mapped the display-critical and real-time audio thread types to
+Exec priorities +8 and +10. Exec serves strictly by priority, so such a
+thread that stays ready starves every system task below it: the
+filesystems, AROSTCP (5), native AROS's USB device service (1) and the
+priority-0 graphics, Intuition and Wanderer tasks. On the M1 the whole
+machine stopped answering half a minute after the browser window opened,
+the pointer still moving (input.device runs at 20). Display and audio
+threads now get the IO pumps' priority, 1: they preempt the browser's own
+CPU-bound work, never the system's.
+---
+ base/threading/platform_thread_aros.cc | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/base/threading/platform_thread_aros.cc b/base/threading/platform_thread_aros.cc
+index 00b7187301..8e52605c37 100644
+--- a/base/threading/platform_thread_aros.cc
++++ b/base/threading/platform_thread_aros.cc
+@@ -345,6 +345,15 @@ const ThreadTypeToNiceValuePair kThreadTypeToNiceValueMap[7] = {
+ // the system tasks; they stay below the DOS handlers and AROSTCP (5).
+ constexpr int kIoPumpMinimumPriority = 1;
+ 
++// No Chromium thread runs above kIoPumpMinimumPriority. Exec serves strictly
++// by priority: a display-critical (+8) or real-time audio (+10) thread that
++// stays ready starves every system task below it, among them the
++// filesystems, AROSTCP (5) and native AROS's USB device service (1), and the
++// whole machine stops answering while the pointer still moves (input.device
++// runs at 20). Display and audio threads get the IO pumps' priority: they
++// preempt the browser's own CPU-bound work, never the system's.
++constexpr int kMaximumThreadPriority = kIoPumpMinimumPriority;
++
+ bool CanSetThreadTypeToRealtimeAudio() {
+   return true;
+ }
+@@ -360,6 +369,8 @@ bool SetCurrentThreadTypeForPlatform(ThreadType thread_type,
+       priority < kIoPumpMinimumPriority) {
+     priority = kIoPumpMinimumPriority;
+   }
++  if (priority > kMaximumThreadPriority)
++    priority = kMaximumThreadPriority;
+   SetTaskPri(task, static_cast<BYTE>(priority));
+   return true;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

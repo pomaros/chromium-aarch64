@@ -1,0 +1,46 @@
+From 601232ee3089442a601a4b8d61c81c2068f5fe87 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 02:50:26 +0200
+Subject: [PATCH 692/696] third_party/abseil: do not mask signals around
+ pthread_setspecific on AROS
+
+The signal mask guards a glibc race: a getspecific running in a signal
+handler can zero the value a concurrent setspecific is storing. AROS
+pthread keys are plain per-task storage without that race. The posixc
+headers of current AROS master also do not declare pthread_sigmask, which
+ends the AArch64 build. Set the key directly on AROS.
+
+This branch also applies to x64. ADT's SDK evidently declares
+pthread_sigmask, since the x64 build compiles today; the masking it skips
+guards nothing on AROS.
+---
+ .../abseil-cpp/absl/base/internal/thread_identity.cc        | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/third_party/abseil-cpp/absl/base/internal/thread_identity.cc b/third_party/abseil-cpp/absl/base/internal/thread_identity.cc
+index 0471a25dce..8b450565a6 100644
+--- a/third_party/abseil-cpp/absl/base/internal/thread_identity.cc
++++ b/third_party/abseil-cpp/absl/base/internal/thread_identity.cc
+@@ -99,6 +99,11 @@ void SetCurrentThreadIdentity(ThreadIdentity* identity,
+   //
+   // While not officially async-signal safe, getspecific within a signal handler
+   // is otherwise OK.
++#if defined(__AROS__)
++  // AROS has no POSIX signals to mask; its pthread keys are plain storage.
++  pthread_setspecific(thread_identity_pthread_key,
++                      reinterpret_cast<void*>(identity));
++#else
+   sigset_t all_signals;
+   sigset_t curr_signals;
+   sigfillset(&all_signals);
+@@ -106,6 +111,7 @@ void SetCurrentThreadIdentity(ThreadIdentity* identity,
+   pthread_setspecific(thread_identity_pthread_key,
+                       reinterpret_cast<void*>(identity));
+   pthread_sigmask(SIG_SETMASK, &curr_signals, nullptr);
++#endif  // __AROS__
+ #endif  // !__EMSCRIPTEN__ && !__MINGW32__
+ 
+ #elif ABSL_THREAD_IDENTITY_MODE == ABSL_THREAD_IDENTITY_MODE_USE_TLS
+-- 
+2.50.1 (Apple Git-155)
+

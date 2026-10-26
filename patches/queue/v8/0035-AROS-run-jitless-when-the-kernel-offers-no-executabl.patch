@@ -1,0 +1,50 @@
+From 721bfae07f5e6e064746f5993558ba30a7388577 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Sat, 24 Oct 2026 00:53:24 +0200
+Subject: [PATCH] AROS: run jitless when the kernel offers no executable code
+ pages
+
+V8::Initialize asks the embedder's AROS glue for the kernel's JIT mode
+(__aros_v8_jit_mode, <aros/apple/jit.h>). In mode NONE (no SPRR write
+switch, no RWX guest pages) generated code cannot become executable: V8
+runs jitless, which also spares the code range reservation that otherwise
+fails with "Failed to reserve virtual memory for CodeRange" and aborts the
+first isolate.
+---
+ src/init/v8.cc | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/init/v8.cc b/src/init/v8.cc
+index 402ff83..20b3fb4 100644
+--- a/src/init/v8.cc
++++ b/src/init/v8.cc
+@@ -45,6 +45,12 @@ extern "C" v8::Platform* __aros_v8_get_current_platform();
+ extern "C" v8::Platform* __aros_v8_forget_platform(v8::Platform* platform);
+ #endif
+ 
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++// The kernel's JIT mode, from the embedder's AROS glue (<aros/apple/jit.h>):
++// 0 none, 1 SPRR, 2 RWX.
++extern "C" int __aros_v8_jit_mode(void);
++#endif
++
+ namespace v8 {
+ namespace internal {
+ 
+@@ -176,6 +182,13 @@ void V8::Initialize() {
+       V8StartupState::kV8Initialized) {
+     return;
+   }
++#endif
++#if V8_HAS_AROS_JIT_WRITE_PROTECT
++  // Generated code needs the kernel's executable code pages. A kernel that
++  // offers none (AROS_APPLE_JIT_NONE: no SPRR switch, no RWX guest pages)
++  // leaves the interpreters only: run jitless rather than reserve a code
++  // range nothing can make executable.
++  if (__aros_v8_jit_mode() == 0) v8_flags.jitless = true;
+ #endif
+   AdvanceStartupState(V8StartupState::kV8Initializing);
+   CHECK(platform_);
+-- 
+2.50.1 (Apple Git-155)
+

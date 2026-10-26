@@ -1,0 +1,160 @@
+From: John Knipper <code@jkn.me>
+Subject: [PATCH] aros: qualify native 64-bit page and pool allocation
+
+Add an executable that exercises high-address pages, checked permissions,
+zeroing, partial releases and actual pool allocation. Separate deliberate
+fault modes check hardware enforcement and must fault rather than pass.
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn b/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn
+--- a/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn
++++ b/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn
+@@ -356,6 +356,19 @@
+       ":allocator_core",
+       ":allocator_shim",
+     ]
++  }
++
++  if (is_aros) {
++    executable("aros_native_page_probe") {
++      testonly = true
++      sources = [ "aros_native_page_probe.cc" ]
++      libs = [ "debug" ]
++      deps = [
++        ":allocator_base",
++        ":allocator_core",
++        ":allocator_shim",
++      ]
++    }
+   }
+
+   component("allocator_core") {
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/aros_native_page_probe.cc b/base/allocator/partition_allocator/src/partition_alloc/aros_native_page_probe.cc
+new file mode 100644
+--- /dev/null
++++ b/base/allocator/partition_allocator/src/partition_alloc/aros_native_page_probe.cc
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 John Knipper
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "partition_alloc/page_allocator.h"
++#include "partition_alloc/partition_address_space.h"
++#include "partition_alloc/partition_alloc.h"
++#include "partition_alloc/partition_alloc_buildflags.h"
++
++extern "C" void ArosKPutStr(const char*) asm("KPutStr");
++
++namespace {
++namespace pa = partition_alloc;
++using Access = pa::PageAccessibilityConfiguration;
++constexpr Access kRW(Access::kReadWrite);
++constexpr Access kR(Access::kRead);
++constexpr Access kNone(Access::kInaccessible);
++
++void Require(bool condition, const char* description) {
++  if (!condition) {
++    std::printf("PA_NATIVE FAIL %s\n", description);
++    std::fflush(stdout);
++    std::exit(20);
++  }
++}
++
++void OutOfMemory(size_t length) {
++  std::printf("PA_NATIVE FAIL oom bytes=%zu\n", length);
++  std::fflush(stdout);
++  std::exit(20);
++}
++
++void Reacquire(uintptr_t address, size_t length, size_t page) {
++  uintptr_t result = pa::AllocPages(address, length, page, kRW);
++  Require(result == address, "released native range must be reusable exactly");
++  std::memset(reinterpret_cast<void*>(result), 0x63, length);
++  pa::FreePages(result, length);
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++  static_assert(BUILDFLAG(HAS_64_BIT_POINTERS));
++  static_assert(sizeof(void*) == 8);
++  const size_t page = pa::internal::PageAllocationGranularity();
++  std::printf("PA_NATIVE begin width=64 page=%zu\n", page);
++  std::fflush(stdout);
++  const size_t baseline = pa::GetTotalMappedSize();
++  uintptr_t p = pa::AllocPages(5 * page, 32 * page, kRW);
++  Require(p && p > (uintptr_t{1} << 38), "native address beyond old 256GiB bitmap");
++  Require((p & (32 * page - 1)) == 0, "native alignment");
++  auto* bytes = reinterpret_cast<volatile unsigned char*>(p);
++  for (size_t i = 0; i < 5 * page; ++i) bytes[i] = 0x5a;
++  Require(pa::TrySetSystemPagesAccess(p, 5 * page, kR), "checked read protection");
++  for (size_t i = 0; i < 5 * page; ++i)
++    Require(bytes[i] == 0x5a, "permission changes preserve bytes");
++  if (argc == 2 && std::strcmp(argv[1], "fault-readonly") == 0) {
++    std::puts("PA_NATIVE negative readonly armed");
++    ArosKPutStr("PA_NATIVE negative readonly armed\n");
++    std::fflush(stdout);
++    bytes[0] = 1;
++    Require(false, "write unexpectedly accepted on read-only page");
++  }
++  Require(pa::TrySetSystemPagesAccess(p, 5 * page, kRW), "checked RW restoration");
++  Require(pa::DecommitAndZeroSystemPages(p, 5 * page, pa::PageTag::kChromium),
++          "decommit and zero");
++  Require(pa::TryRecommitSystemPages(p, 5 * page, kRW,
++             pa::PageAccessibilityDisposition::kRequireUpdate), "checked recommit");
++  for (size_t i = 0; i < 5 * page; ++i)
++    Require(bytes[i] == 0, "anonymous recommit zero");
++  Require(pa::TrySetSystemPagesAccess(p, 5 * page, kNone), "checked inaccessible");
++  if (argc == 2 && std::strcmp(argv[1], "fault-none") == 0) {
++    std::puts("PA_NATIVE negative inaccessible armed");
++    ArosKPutStr("PA_NATIVE negative inaccessible armed\n");
++    std::fflush(stdout);
++    volatile unsigned char observed = bytes[0];
++    (void)observed;
++    Require(false, "read unexpectedly accepted on inaccessible page");
++  }
++  Require(pa::TrySetSystemPagesAccess(p, 5 * page, kRW), "restore after none");
++  pa::FreePages(p + 2 * page, page);
++  Require(!pa::TrySetSystemPagesAccess(p + 2 * page, page, kRW), "freed range rejected");
++  Reacquire(p + 2 * page, page, page);
++  pa::FreePages(p, page);
++  Reacquire(p, page, page);
++  pa::FreePages(p + 4 * page, page);
++  Reacquire(p + 4 * page, page, page);
++  pa::FreePages(p + page, page);
++  pa::FreePages(p + 3 * page, page);
++  Require(pa::GetTotalMappedSize() == baseline, "partial-free mapped accounting");
++  uintptr_t aligned = pa::AllocPagesWithAlignOffset(0, 3 * page, 64 * page,
++                                                   7 * page, kRW);
++  Require(aligned && aligned % (64 * page) == 7 * page, "offset alignment");
++  Require(pa::GetTotalMappedSize() == baseline + 3 * page, "trim mapped accounting");
++  std::memset(reinterpret_cast<void*>(aligned), 0x37, 3 * page);
++  pa::FreePages(aligned, 3 * page);
++  Reacquire(aligned, 3 * page, page);
++  Require(pa::GetTotalMappedSize() == baseline, "final page accounting");
++  std::puts("PA_NATIVE pages PASS");
++  std::fflush(stdout);
++
++  pa::PartitionAllocGlobalInit(OutOfMemory);
++  pa::PartitionAllocator allocator(pa::PartitionOptions{});
++  for (size_t size : {size_t{16}, size_t{4096}, size_t{65536}, size_t{1048576}}) {
++    void* object = allocator.root()->Alloc(size, "AROS native qualification");
++    Require(object != nullptr, "pool allocation");
++    const uintptr_t address = reinterpret_cast<uintptr_t>(object);
++    Require(address > (uintptr_t{1} << 38) &&
++                pa::internal::PartitionAddressSpace::IsInRegularPool(address),
++            "actual high-address regular pool");
++    std::memset(object, 0x71, size);
++    Require(static_cast<unsigned char*>(object)[size - 1] == 0x71, "pool data");
++    allocator.root()->Free(object);
++  }
++  void* object = allocator.root()->AlignedAlloc(64 * 1024, 128 * 1024);
++  Require(object && !(reinterpret_cast<uintptr_t>(object) & (64 * 1024 - 1)),
++          "aligned pool allocation");
++  allocator.root()->Free(object);
++  // User allocations are released; the global pools retain eager backing.
++  std::puts("PA_NATIVE pool PASS");
++  std::puts("PA_NATIVE result=PASS");
++  return 0;
++}

@@ -1,0 +1,35 @@
+From: John KNIPPER <code@jkn.me>
+Date: Sun, 25 Oct 2026 05:40:00 +0200
+Subject: [PATCH] AROS: the custom font manager falls back by character
+
+onMatchFamilyStyleCharacter returned nothing, so a page in a script the
+default family lacks (Arabic, Hebrew, CJK) drew missing-glyph boxes even
+with a font for it in FONTS:TrueType. Return the first family, in directory
+order, whose closest style has a glyph for the character. example.com renders
+its Arabic and Chinese paragraphs in the PomAROS VM with Noto fonts.
+
+--- a/src/ports/SkFontMgr_custom.cpp
++++ b/src/ports/SkFontMgr_custom.cpp
+@@ -188,10 +188,20 @@
+ }
+ 
+ sk_sp<SkTypeface> SkFontMgr_Custom::onMatchFamilyStyleCharacter(
+-    const char familyName[], const SkFontStyle&,
++    const char familyName[], const SkFontStyle& style,
+     const char* bcp47[], int bcp47Count,
+-    SkUnichar) const
++    SkUnichar character) const
+ {
++    // Fallback by character: the first family, in directory order, whose
++    // closest style has a glyph for it. Without this a page in a script the
++    // default family lacks (Arabic, CJK) draws missing-glyph boxes even when
++    // the directory holds a font for it.
++    for (int i = 0; i < fFamilies.size(); ++i) {
++        sk_sp<SkTypeface> face = fFamilies[i]->matchStyle(style);
++        if (face && face->unicharToGlyph(character) != 0) {
++            return face;
++        }
++    }
+     return nullptr;
+ }
+ 

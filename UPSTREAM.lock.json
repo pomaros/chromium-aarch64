@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "upstreams": [
+    {
+      "url": "https://github.com/terminills/chromium-aros-patches",
+      "revision": "d77e7a3f2e1b6c6cc6f6c71a0eb44438f524d4c8"
+    },
+    {
+      "url": "https://github.com/terminills/aros-web",
+      "revision": "0631e9e78f5ebfc3f5fb65a9ea24ad11498a9612"
+    }
+  ],
+  "chromium_base": "e115223459bbd8f3349e0080592cb4482994bfc3",
+  "v8_base": "309640da62fae0485c7e4f64829627c92d53b35d",
+  "core_candidate": "cfde7cf3d48d2b54abf0e7c1fd6b0bcb295bdcb6"
+}

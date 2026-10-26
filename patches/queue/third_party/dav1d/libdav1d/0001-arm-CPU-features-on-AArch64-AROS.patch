@@ -1,0 +1,49 @@
+From 1b117b7d2db522b95cf58f720c6202c1ab331276 Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 12:20:31 +0200
+Subject: [PATCH] arm: CPU features on AArch64 AROS
+
+AROS has no getauxval(); its kernel decodes the ID registers once and
+serves the feature words through KrnGetSystemAttr(KATTR_HWCap) and
+(KATTR_HWCap2), in the Linux AT_HWCAP bit layout. The AArch64 AROS branch
+maps them exactly as the Linux branch does.
+---
+ src/arm/cpu.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/arm/cpu.c b/src/arm/cpu.c
+index d9b1751..2f8bdf5 100644
+--- a/src/arm/cpu.c
++++ b/src/arm/cpu.c
+@@ -31,7 +31,30 @@
+ 
+ #include "src/arm/cpu.h"
+ 
+-#if defined(HAVE_GETAUXVAL) || defined(HAVE_ELF_AUX_INFO)
++#if defined(__AROS__) && ARCH_AARCH64
++
++/* AArch64 AROS: the kernel decodes the ID registers once and serves the
++ * feature words through KrnGetSystemAttr(), in the Linux AT_HWCAP layout. */
++#include <aros/aarch64/hwcap.h>
++#include <proto/exec.h>
++#include <proto/kernel.h>
++
++COLD unsigned dav1d_get_cpu_flags_arm(void) {
++    APTR kernel = OpenResource((CONST_STRPTR) "kernel.resource");
++    intptr_t caps = kernel ? __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap, kernel) : -1;
++    intptr_t caps2 = kernel ? __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap2, kernel) : -1;
++    unsigned long hw_cap = caps == -1 ? 0 : (unsigned long)caps;
++    unsigned long hw_cap2 = caps2 == -1 ? 0 : (unsigned long)caps2;
++
++    unsigned flags = DAV1D_ARM_CPU_FLAG_NEON;
++    flags |= (hw_cap & AROS_HWCAP_ASIMDDP) ? DAV1D_ARM_CPU_FLAG_DOTPROD : 0;
++    flags |= (hw_cap2 & AROS_HWCAP2_I8MM) ? DAV1D_ARM_CPU_FLAG_I8MM : 0;
++    flags |= (hw_cap & AROS_HWCAP_SVE) ? DAV1D_ARM_CPU_FLAG_SVE : 0;
++    flags |= (hw_cap2 & AROS_HWCAP2_SVE2) ? DAV1D_ARM_CPU_FLAG_SVE2 : 0;
++    return flags;
++}
++
++#elif defined(HAVE_GETAUXVAL) || defined(HAVE_ELF_AUX_INFO)
+ #include <sys/auxv.h>
+ 
+ #if ARCH_AARCH64

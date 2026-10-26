@@ -1,0 +1,221 @@
+{
+  "schema": 1,
+  "patches": [
+    {
+      "path": "patches/queue/angle/0006-include-AROS-native-EGL-types-in-eglplatform.h.patch",
+      "sha256": "a5d3ad33fa51d52be6cba8b22b6fb939781513b2d9007961429387ce04201626",
+      "bytes": 1174
+    },
+    {
+      "path": "patches/queue/angle/0007-common-static-thread-locals-on-AROS.patch",
+      "sha256": "ffd4d5ea8f3b79598d21b5573386bbab417722987eda8ae1922f097cd4554874",
+      "bytes": 1481
+    },
+    {
+      "path": "patches/queue/net/third_party/quiche/src/0002-quic-AROS-socket-calls-through-the-socket-library-Si.patch",
+      "sha256": "8680b28a0e9d1e77ed1a80acd64b1c36395db03b9f4c177eef41ab41fd093056",
+      "bytes": 4263
+    },
+    {
+      "path": "patches/queue/src/0690-build-add-the-AArch64-AROS-clang-toolchain.patch",
+      "sha256": "1448e229dae6e9d2804ccdda6780959561dd965b762152e0ef92bd7a61354456",
+      "bytes": 6932
+    },
+    {
+      "path": "patches/queue/src/0691-third_party-zlib-keep-the-ARM-SIMD-paths-off-on-AROS.patch",
+      "sha256": "71fa00ed1ecb86c468bc512481e3f49ccfc217549948503360105692f3d4779f",
+      "bytes": 1234
+    },
+    {
+      "path": "patches/queue/src/0692-third_party-abseil-do-not-mask-signals-around-pthrea.patch",
+      "sha256": "6b20c4fea2a40308706649bdcb5f2e8f89f9fee90a2afa85825d3a73cd8ba299",
+      "bytes": 2053
+    },
+    {
+      "path": "patches/queue/src/0693-build-generate-AArch64-import-trampolines-for-the-sh.patch",
+      "sha256": "ebe71efce2e1972292c4871f1723d9befcbab8ed13da9782a1062f110abdd935",
+      "bytes": 12880
+    },
+    {
+      "path": "patches/queue/src/0694-partition_alloc-reach-stdc.library-vectors-on-AArch6.patch",
+      "sha256": "056d58135c9654725575e2901cce0d3deeb02b90582f9dbc9cc402c43a9af5c7",
+      "bytes": 3645
+    },
+    {
+      "path": "patches/queue/src/0695-aros-keep-the-x86-64-only-pieces-out-of-the-AArch64-.patch",
+      "sha256": "705cae77d790bc6429f0733c6738363e7eefaeba24ddcf61498d23c18d6204c0",
+      "bytes": 8361
+    },
+    {
+      "path": "patches/queue/src/0696-aros-build-base-against-the-AROS-SDK-on-AArch64.patch",
+      "sha256": "f21fa83ac4c6065bac32a7d6edd3fcee2c45fe91a8258229c97eb1809142d41d",
+      "bytes": 3438
+    },
+    {
+      "path": "patches/queue/src/0697-build-a-macOS-host-for-the-AROS-target.patch",
+      "sha256": "b585e5f8091d59ee4d5786cb7615b08d15306ab90ac44de2f356ed4b87442c54",
+      "bytes": 5092
+    },
+    {
+      "path": "patches/queue/src/0698-lzma_sdk-CPU-features-from-the-kernel-on-AROS.patch",
+      "sha256": "02278098bc3d4a60223b54b86ad248322561809955766bb4cb58134d2cf4a46c",
+      "bytes": 1827
+    },
+    {
+      "path": "patches/queue/src/0699-aros-link-chrome-on-AArch64.patch",
+      "sha256": "6dc8be0cbd2cb83bb4bfad8cc1929394a13c0223d4dc9f000b881c2887736beb",
+      "bytes": 45945
+    },
+    {
+      "path": "patches/queue/src/0700-aros-link-AArch64-programs-whose-code-exceeds-BL-s-r.patch",
+      "sha256": "8631fa87cf3af527eb9d3ff3dcab2ede8bbb34e0418749f3e65117a80ecf7da3",
+      "bytes": 17580
+    },
+    {
+      "path": "patches/queue/src/0701-aros-no-volume-requesters-for-chrome-a-failed-file-l.patch",
+      "sha256": "5456b46016f6082f6fe6bb3b6cc30c1347984c1683b34ed7e3a7d7c2836d6675",
+      "bytes": 3348
+    },
+    {
+      "path": "patches/queue/src/0702-aros-no-Chromium-thread-above-Exec-priority-1.patch",
+      "sha256": "f7fb50e0ba39603416e1c038ff39122402ea505103f13e42cc17b79b9bd23872",
+      "bytes": 2328
+    },
+    {
+      "path": "patches/queue/src/0703-aros-preserve-most-registers-in-AArch64-import-res.patch",
+      "sha256": "1e692dcb2019ce4098d45f93fa404508202d5310e54de79bb5a4553c16147d2e",
+      "bytes": 3798
+    },
+    {
+      "path": "patches/queue/src/0704-aros-use-native-64-bit-PartitionAlloc-pages.patch",
+      "sha256": "1ec42c5e85f10992fd12c71429acac58705ed8d0e965d55677d794dcd92dbe45",
+      "bytes": 37968
+    },
+    {
+      "path": "patches/queue/src/0705-aros-qualify-native-64-bit-page-and-pool-allocation.patch",
+      "sha256": "753aa742936484e36de962edb7330ccfae7b628069ae42731345576b8c938617",
+      "bytes": 6886
+    },
+    {
+      "path": "patches/queue/src/0706-aros-preserve-native-v8-buffer-ownership.patch",
+      "sha256": "e75fed4aa555efc4bd8c4c24e73176c0349a883d408f2e7d54fb6d066cc61d64",
+      "bytes": 6913
+    },
+    {
+      "path": "patches/queue/src/0707-aros-register-live-v8-heap-ownership.patch",
+      "sha256": "a1a0a89597b023f9a3125f16c51bad601723832ddccbeea588ab7e01abbdc6c0",
+      "bytes": 6573
+    },
+    {
+      "path": "patches/queue/src/0708-aros-reserve-PartitionAlloc-pages-without-memory.patch",
+      "sha256": "6ae203b2ff43860b41b6c62f84b1768810fc5d18cd096fec0f0aabcdd64a83dc",
+      "bytes": 6382
+    },
+    {
+      "path": "patches/queue/third_party/cpuinfo/src/0001-arm-AArch64-AROS-backend-from-the-kernel-s-HWCAP-wor.patch",
+      "sha256": "9569c3b8c67846a194138a28ad7940fa67ee8007eadee5ba946f738e8c17183b",
+      "bytes": 5167
+    },
+    {
+      "path": "patches/queue/third_party/dav1d/libdav1d/0001-arm-CPU-features-on-AArch64-AROS.patch",
+      "sha256": "d6607c078b25325d826cd18fb5c1d80fbeef3aa696bb8e84b7691ef334cd23bc",
+      "bytes": 1955
+    },
+    {
+      "path": "patches/queue/third_party/dawn/0002-AROS-Vulkan-backend-on-AArch64-AROS.patch",
+      "sha256": "099b680dc35ed0c4ca1fc6012a57a12ac7ee6533791bed619a1f76b3c64ad28f",
+      "bytes": 9539
+    },
+    {
+      "path": "patches/queue/third_party/farmhash/src/0001-AROS-byte-swaps-through-the-compiler-builtins.patch",
+      "sha256": "396f543e87affaf1499da575c283d0e6e5e9529ba55d390ba0e71bef39a83a8f",
+      "bytes": 742
+    },
+    {
+      "path": "patches/queue/third_party/ffmpeg/0002-build-fpthread-is-GCC-s-spelling-clang-links-pthread.patch",
+      "sha256": "80dcbed4faa5e560db5184d76cc86b249b81c3372c30ee3a3326bdba3eda72db",
+      "bytes": 939
+    },
+    {
+      "path": "patches/queue/third_party/libaom/source/libaom/0001-arm-CPU-features-on-AArch64-AROS.patch",
+      "sha256": "a53215ccb29c83fbe9e9f35092024fb86a0a0315e4cda2f549137d51fb85db22",
+      "bytes": 2364
+    },
+    {
+      "path": "patches/queue/third_party/libvpx/source/libvpx/0001-arm-CPU-features-on-AArch64-AROS.patch",
+      "sha256": "6ca1a06bb4450c24a1100e4c6f9ffdb9077c70bdc29692d1607c7e903acd5226",
+      "bytes": 2260
+    },
+    {
+      "path": "patches/queue/third_party/openscreen/src/0001-AROS-constinit-on-the-extern-thread_local.patch",
+      "sha256": "c74cbb9184b77ebce8dbf00e3e76f088aa6214374744d7a81968a4b8d5638a4e",
+      "bytes": 2029
+    },
+    {
+      "path": "patches/queue/third_party/re2/src/0001-AROS-constinit-on-the-extern-thread_local.patch",
+      "sha256": "b0495a57b64f99b576892e176dc39a4d2147e9af5b0482269ed224d33408b8ba",
+      "bytes": 1359
+    },
+    {
+      "path": "patches/queue/third_party/skia/0001-AROS-custom-font-manager-falls-back-by-character.patch",
+      "sha256": "91e9dae1c8dabafdd0cbac3323f724406ee930e514aa4189d7dee4c13c006a1e",
+      "bytes": 1407
+    },
+    {
+      "path": "patches/queue/third_party/webrtc/0008-api-drop-lifetimebound-from-the-deprecated-Candidate.patch",
+      "sha256": "f45dd172aadfad2253fea9a5673a8b8e08d1dd29b5f5cc1395bae5980ce4872f",
+      "bytes": 1490
+    },
+    {
+      "path": "patches/queue/third_party/webrtc/0009-rtc_base-initialise-timeval-with-its-own-field-types.patch",
+      "sha256": "42d5803aff468a086348a7c0014d476eb7577f74b26ffece0d1bba434460bc53",
+      "bytes": 1338
+    },
+    {
+      "path": "patches/queue/v8/0032-AROS-AArch64-target-support.patch",
+      "sha256": "10b04ae629e517130172971ee7e238ed18aaed100cfceccab4df4259b45d6b3c",
+      "bytes": 8505
+    },
+    {
+      "path": "patches/queue/v8/0033-AROS-JIT-code-pages-on-AArch64.patch",
+      "sha256": "a0082cd16bc1ffc8a31b306d1187eaaaf05570c1e46183f6013e17ad59aecbc7",
+      "bytes": 15340
+    },
+    {
+      "path": "patches/queue/v8/0034-AROS-give-trimmed-JIT-pages-back-at-once.patch",
+      "sha256": "cbc4daa76186fd11f0fe7820874c16f54dda1388a715f29fa2882a653861594f",
+      "bytes": 3709
+    },
+    {
+      "path": "patches/queue/v8/0035-AROS-run-jitless-when-the-kernel-offers-no-executabl.patch",
+      "sha256": "4b2a515eb1168dcf16a0e2738aa0cbaee2dd53fe91640a000e0a7d5ae2b82513",
+      "bytes": 1782
+    },
+    {
+      "path": "patches/queue/v8/0036-AROS-commit-JIT-mappings-through-their-protection.patch",
+      "sha256": "fd6b7d9e6226c7bba2a9578c0936dd98f01328270e73f1d4ae72101f47f128ae",
+      "bytes": 1502
+    },
+    {
+      "path": "patches/queue/v8/0037-AROS-take-the-stack-start-from-the-task.patch",
+      "sha256": "39c160c203925b8549de7f444a7a37fcdf58f0ff20a8005d7cb2320cd8513597",
+      "bytes": 1726
+    },
+    {
+      "path": "patches/standalone/abseil-cpp.patch",
+      "sha256": "4f09d0a95dd448604f9e3155f3e2fa6248bb361312d16da26ab9aa4f4a72447f",
+      "bytes": 6989
+    },
+    {
+      "path": "patches/standalone/build.patch",
+      "sha256": "33c79c1c158f81deda91e83cbd6a8c29f9fb0add9c9d61e6e6fbe86f5e8ab112",
+      "bytes": 10085
+    },
+    {
+      "path": "patches/standalone/zlib.patch",
+      "sha256": "af7cd112d37be7d7bae4314703baba8dbcf706e7e8c54bf8582772d5d2337460",
+      "bytes": 552
+    }
+  ],
+  "scope": "reviewed downstream patch snapshot; full queue replay is pending"
+}

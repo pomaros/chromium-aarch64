@@ -1,0 +1,45 @@
+From e3e4a5870cf926024569f65ea6ee603b72b468ef Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 04:25:08 +0200
+Subject: [PATCH 7/7] common: static thread-locals on AROS
+
+The AROS loader refuses GOT relocations, which every extern thread_local
+access from another unit produces under emulated TLS (3320 of them for
+gCurrentValidContext and gCurrentThread). ANGLE's static thread-local
+variant keeps them in one unit behind accessors.
+---
+ BUILD.gn              | 5 +++++
+ src/common/platform.h | 4 ++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/BUILD.gn b/BUILD.gn
+index db1dcfc..068136f 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1849,3 +1849,8 @@ group("angle_static") {
+     ":translator",
+   ]
+ }
++
++group("aros_probe_root") {
++  testonly = true
++  deps = [ "//aros_probe:angle_probe" ]
++}
+diff --git a/src/common/platform.h b/src/common/platform.h
+index df469d3..a5d95ab 100644
+--- a/src/common/platform.h
++++ b/src/common/platform.h
+@@ -23,6 +23,10 @@
+ #elif defined(__AROS__)
+ #    define ANGLE_PLATFORM_AROS 1
+ #    define ANGLE_PLATFORM_POSIX 1
++// The AROS loader takes no GOT relocation, which an extern thread_local
++// read from another unit produces under emulated TLS: keep ANGLE's current
++// thread and context in static thread-locals behind accessors.
++#    define ANGLE_USE_STATIC_THREAD_LOCAL_VARIABLES 1
+ #elif defined(__ggp__)
+ #    define ANGLE_PLATFORM_GGP 1
+ #    define ANGLE_PLATFORM_POSIX 1
+-- 
+2.50.1 (Apple Git-155)
+

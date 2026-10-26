@@ -1,0 +1,67 @@
+From 498f65d970ccdf61cd81937ef41087b6cdce6fbd Mon Sep 17 00:00:00 2001
+From: John KNIPPER <code@jkn.me>
+Date: Fri, 23 Oct 2026 12:20:30 +0200
+Subject: [PATCH] arm: CPU features on AArch64 AROS
+
+AROS has no getauxval(); its kernel decodes the ID registers once and
+serves the feature words through KrnGetSystemAttr(KATTR_HWCap) and
+(KATTR_HWCap2), in the Linux AT_HWCAP bit layout. The AArch64 AROS branch
+maps them exactly as the Linux branch does.
+---
+ aom_ports/aarch64_cpudetect.c | 43 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/aom_ports/aarch64_cpudetect.c b/aom_ports/aarch64_cpudetect.c
+index 159e5b1..c3d380f 100644
+--- a/aom_ports/aarch64_cpudetect.c
++++ b/aom_ports/aarch64_cpudetect.c
+@@ -99,6 +99,49 @@ static int arm_get_cpu_caps(void) {
+   return flags;
+ }
+ 
++#elif defined(__AROS__)
++
++// AArch64 AROS: the kernel decodes the ID registers once and serves the
++// feature words through KrnGetSystemAttr(), in the Linux AT_HWCAP layout.
++#include <aros/aarch64/hwcap.h>
++#include <proto/exec.h>
++#include <proto/kernel.h>
++
++static void aros_hwcap(unsigned long *hwcap, unsigned long *hwcap2) {
++  APTR kernel = OpenResource((CONST_STRPTR) "kernel.resource");
++  intptr_t caps = kernel ? __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap, kernel) : -1;
++  intptr_t caps2 = kernel ? __inline_Kernel_KrnGetSystemAttr(KATTR_HWCap2, kernel) : -1;
++  *hwcap = caps == -1 ? 0 : (unsigned long)caps;
++  *hwcap2 = caps2 == -1 ? 0 : (unsigned long)caps2;
++}
++
++static int arm_get_cpu_caps(void) {
++  int flags = 0;
++  unsigned long hwcap, hwcap2;
++  aros_hwcap(&hwcap, &hwcap2);
++  (void)hwcap;
++  (void)hwcap2;
++#if HAVE_NEON
++  flags |= HAS_NEON;  // Neon is mandatory in Armv8.0-A.
++#endif  // HAVE_NEON
++#if HAVE_ARM_CRC32
++  if (hwcap & AROS_HWCAP_CRC32) flags |= HAS_ARM_CRC32;
++#endif  // HAVE_ARM_CRC32
++#if HAVE_NEON_DOTPROD
++  if (hwcap & AROS_HWCAP_ASIMDDP) flags |= HAS_NEON_DOTPROD;
++#endif  // HAVE_NEON_DOTPROD
++#if HAVE_NEON_I8MM
++  if (hwcap2 & AROS_HWCAP2_I8MM) flags |= HAS_NEON_I8MM;
++#endif  // HAVE_NEON_I8MM
++#if HAVE_SVE
++  if (hwcap & AROS_HWCAP_SVE) flags |= HAS_SVE;
++#endif  // HAVE_SVE
++#if HAVE_SVE2
++  if (hwcap2 & AROS_HWCAP2_SVE2) flags |= HAS_SVE2;
++#endif  // HAVE_SVE2
++  return flags;
++}
++
+ #elif defined(__linux__)  // end defined(AOM_USE_ANDROID_CPU_FEATURES)
+ 
+ #include <sys/auxv.h>
