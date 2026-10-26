@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+"""Build the canonical AArch64 import trampoline contract probe in isolation."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT.parent
+IMPORTS = ["tramp_ints", "tramp_floats", "tramp_big", "tramp_variadic", "tramp_preserve"]
+
+
+def identity(path):
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path, help="new exclusive output directory")
+    parser.add_argument("--sdk", type=Path, required=True, help="matching configured guest Developer SDK; no historical fallback")
+    parser.add_argument("--crosstools", "--ct", type=Path, default=WORKSPACE / "aros-crosstools", help="toolchain root, containing bin/clang")
+    emitter = parser.add_mutually_exclusive_group(required=True)
+    emitter.add_argument("--chromium", type=Path, help="explicit prepared Chromium source checkout")
+    emitter.add_argument("--generator", type=Path, help="explicit shared emitter, including a negative control")
+    parser.add_argument("--generated-include", type=Path)
+    parser.add_argument("--host-tools", type=Path)
+    args = parser.parse_args()
+    sdk = args.sdk.resolve()
+    cross = args.crosstools.resolve()
+    generator = (args.generator or args.chromium / "build/config/aros/import_trampolines_arm64.py").resolve()
+    generated_include = (args.generated_include or sdk.parents[1] / "gen/include").resolve()
+    host_tools = (args.host_tools or sdk.parents[3] / "bin/darwin-aarch64/tools").resolve()
+    clang = cross / "bin/clang"
+    sources = [ROOT / "probes/import_tramp_probe.c", ROOT / "probes/import_tramp_preserve.S"]
+    for path in [*sources, generator, clang, sdk / "lib/startup.o"]:
+        if not path.is_file():
+            parser.error(f"missing input: {path}")
+    for path in [sdk / "include", generated_include, host_tools, cross / "lib/generic"]:
+        if not path.is_dir():
+            parser.error(f"missing input directory: {path}")
+
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = {"result": "FAIL_BUILD", "runtime": "UNTESTED", "sources": [identity(p) for p in sources],
+                "generator": identity(generator), "compiler": identity(clang), "sdk": str(sdk),
+                "startup": identity(sdk / "lib/startup.o"), "imports": IMPORTS}
+    manifest_path = output / "build-manifest.json"
+    try:
+        # Execute the actual shared emitter without creating a Python cache in its checkout.
+        namespace = {"__name__": "import_tramp_probe_generator", "__file__": str(generator)}
+        exec(compile(generator.read_bytes(), str(generator), "exec"), namespace)
+        keywords = dict(generator=str(generator), symbols=IMPORTS, slow_path="ArosTrampImportSlowPath",
+                        resolver="ArosResolveTrampImport", slots="g_tramp_import_slots",
+                        count="g_tramp_import_count", names="g_tramp_import_names")
+        manifest["generation"] = {"call": "emit", "kwargs": keywords}
+        assembly = output / "import_trampolines.S"
+        assembly.write_text(namespace["emit"](**keywords))
+        frozen = []
+        for source in sources:
+            destination = output / source.name
+            destination.write_bytes(source.read_bytes())
+            frozen.append(destination)
+        binary = output / "ImportTrampProbe"
+        command = [str(clang), "--target=aarch64-unknown-aros", "-mcmodel=large", "-fno-pic", "-fno-pie",
+                   "-O2", "-Wall", "-Wextra", "-isystem", str(sdk / "include"),
+                   "-isystem", str(generated_include), "-isystem", str(sdk / "include/aros/stdc"),
+                   "-nostartfiles", "-nodefaultlibs", "-L", str(sdk / "lib"), "-L", str(cross / "lib/generic"),
+                   str(sdk / "lib/startup.o"), *(str(p) for p in frozen), str(assembly), "-o", str(binary),
+                   "-Wl,--start-group", "-ldos", "-lexec", "-laros", "-lautoinit", "-llibinit", "-lutility",
+                   "-lamiga", "-larossupport", "-lstdcio", "-lstdc", "-lclang_rt.builtins-aarch64", "-Wl,--end-group"]
+        environment = dict(os.environ, COMPILER_PATH=f"{host_tools}:{cross / 'bin'}")
+        manifest.update(command=command, environment={"COMPILER_PATH": environment["COMPILER_PATH"]},
+                        generated_assembly=identity(assembly), frozen_sources=[identity(p) for p in frozen])
+        with (output / "build.log").open("x") as log:
+            run = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT, check=False)
+        manifest["returncode"] = run.returncode
+        if run.returncode:
+            raise RuntimeError(f"clang exited {run.returncode}; see {output / 'build.log'}")
+        for item in [*manifest["sources"], manifest["generator"], manifest["compiler"], manifest["startup"]]:
+            if identity(Path(item["path"])) != item:
+                raise RuntimeError(f"input changed during build: {item['path']}")
+        manifest.update(result="PASS_BUILD", binary=identity(binary))
+    except Exception as error:
+        manifest["error"] = str(error)
+        raise
+    finally:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"build-import-tramp-probe result=PASS_BUILD binary={binary} sha256={manifest['binary']['sha256']} runtime=UNTESTED")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError) as error:
+        print(f"build-import-tramp-probe result=FAIL reason={error}", file=sys.stderr)
+        sys.exit(1)
