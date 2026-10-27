@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+"""Generate standalone Dawn arguments from explicitly selected AROS SDK inputs."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+
+def gn_string(path):
+    return json.dumps(str(path), ensure_ascii=False).replace('$', '\\$')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('output', type=Path, help='new output directory for args.gn and input identities')
+    parser.add_argument('--sdk', required=True, type=Path, help='configured AROS/Developer directory')
+    parser.add_argument('--crosstools', required=True, type=Path, help='toolchain root containing bin/clang')
+    parser.add_argument('--host-tools', required=True, type=Path, help='matching SDK host tools containing collect-aros')
+    args = parser.parse_args()
+    sdk, cross, host = (p.resolve() for p in (args.sdk, args.crosstools, args.host_tools))
+    template = Path(__file__).resolve().parent / 'dawn/args-aros-arm64.gn.in'
+    files = [template, cross / 'bin/clang', host / 'collect-aros', sdk / 'lib/startup.o']
+    for path in files:
+        if not path.is_file():
+            parser.error(f'missing input: {path}')
+    if not (sdk / 'include').is_dir():
+        parser.error(f'missing SDK headers: {sdk / "include"}')
+    settings = dict(clang_base_path=cross, aros_clang_root=cross / 'bin',
+                    aros_sysroot=sdk, aros_tool_dir=host)
+    text = template.read_text() + ''.join(f'{key} = {gn_string(value)}\n' for key, value in settings.items())
+    identities = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    (output / 'args.gn').write_text(text)
+    (output / 'inputs.json').write_text(json.dumps(dict(result='CONFIGURED',
+        build='UNTESTED', runtime='UNTESTED', paths={k: str(v) for k, v in settings.items()},
+        inputs=identities, args_sha256=hashlib.sha256(text.encode()).hexdigest()), indent=2) + '\n')
+    print(f'dawn-configure result=CONFIGURED build=UNTESTED runtime=UNTESTED output={output}')
+
+
+if __name__ == '__main__':
+    main()

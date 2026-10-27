@@ -25,6 +25,24 @@ python3 tools/build-import-tramp-probe artifacts/import-probe \
 inputs explicitly. The output directory must be new. A manifest retains input,
 command and binary identities. Build success does not constitute guest execution.
 
+## Standalone Dawn configuration
+
+Generate arguments with an explicit matching SDK and its host tools:
+
+```sh
+python3 tools/configure-dawn /path/to/dawn/out/aros-arm64 \
+  --sdk /path/to/configured-sdk/AROS/Developer \
+  --host-tools /path/to/configured-sdk/host/tools \
+  --crosstools /path/to/aros-crosstools
+```
+
+The output directory must be new. `args.gn` selects the Vulkan-only AArch64 AROS
+configuration; `inputs.json` records compiler, startup, host-tool and template
+hashes. No historical SDK is selected implicitly. This command configures
+arguments only: dependency preparation, pinned patch replay, build, AROS-native
+Vulkan loader integration and runtime qualification are separate requirements.
+The template is not evidence that WebGPU or application GPU acceleration works.
+
 ## Qualification and migration
 
 This initial snapshot contains reviewed generic patches. The import-probe builder is available; complete pinned queue replay, browser build commands, public VM test tooling migration, browser runtime and application GPU acceptance are pending. It is not a browser release. The build tooling is being extracted from its existing integration checkout; that checkout remains the consumer until the extraction is verified. No complete build or runtime qualification is claimed by this repository’s initial commit.
