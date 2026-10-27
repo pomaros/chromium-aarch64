@@ -10,6 +10,15 @@ This repository owns our downstream patches, build integration, packaging and de
 
 `patches/queue/` contains downstream additions by component. `patches/standalone/` contains separate dependency patches; these are not automatically concatenated with an upstream queue. The manifest records exact bytes, not proof that every patch replays or that the browser works.
 
+## Resident V8 buffer ownership
+
+Chromium queue patch `0706-aros-preserve-native-v8-buffer-ownership.patch`
+requires the paired allocation/free vectors in `v8.library` 1.3. Apply
+`patches/standalone/aros-web-v8-buffer-ownership.patch` to the pinned aros-web
+revision before building that resident library. The manifest records its base
+and source revision. The browser and resident must be built and qualified as a
+pair; an exact patch replay does not establish runtime ownership correctness.
+
 ## Import trampoline probe
 
 Build the five-import ABI probe with explicit guest SDK and Chromium emitter inputs:

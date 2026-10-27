@@ -215,6 +215,14 @@
       "path": "patches/standalone/zlib.patch",
       "sha256": "af7cd112d37be7d7bae4314703baba8dbcf706e7e8c54bf8582772d5d2337460",
       "bytes": 552
+    },
+    {
+      "path": "patches/standalone/aros-web-v8-buffer-ownership.patch",
+      "sha256": "bd09cc019efdbb36ae81d7db0c9bdefe7cba0f43602df6b79745a0cb8a202695",
+      "bytes": 6196,
+      "upstream": "https://github.com/terminills/aros-web",
+      "base_revision": "0631e9e78f5ebfc3f5fb65a9ea24ad11498a9612",
+      "source_revision": "9400010d4d492aeb752c45d90be6ceccdaa770e7"
     }
   ],
   "scope": "reviewed downstream patch snapshot; full queue replay is pending"
