@@ -85,9 +85,32 @@ checks symbol movement and resolves the original PC-relative code references.
 Exit 0 and `result=PASS` establish that comparison only; they do not establish
 loading or execution on AROS.
 
+## Generic probes and V8 SDK
+
+`probes/` owns the AROS loader, POSIX, EGL, V8 and Chromium base regression
+sources, plus the detached launcher and requester helper used in application
+fixtures. Build against an explicitly selected SDK. Retaining a probe source
+does not qualify its scenario on a different runtime or architecture.
+
+`tools/v8/install-v8-sdk V8SRC V8OUT DEST` copies V8's headers, generated
+configuration headers and monolithic archive into a new SDK directory. It
+refuses an existing destination. `tools/v8/args-aros-arm64.gn` is a V8 argument
+template whose toolchain paths must be supplied for the selected SDK.
+
+`tools/vm-chrome-run` uses explicit CHROME_DISK, CHROME_MOUNT, NO_REQUESTERS
+and QEMU_PRODUCT_CHECK inputs. It clones the immutable fixture master and
+preserves the selected production checker's exit status. The checker owns
+runtime qualification; the wrapper does not provide an alternate VM backend.
+
+Run its host boundary regressions with:
+
+```sh
+python3 -m unittest discover -s tests
+```
+
 ## Qualification and migration
 
-This initial snapshot contains reviewed generic patches. The import-probe builder is available; complete pinned queue replay, browser build commands, public VM test tooling migration, browser runtime and application GPU acceptance are pending. It is not a browser release. The build tooling is being extracted from its existing integration checkout; that checkout remains the consumer until the extraction is verified. No complete build or runtime qualification is claimed by this repository’s initial commit.
+This initial snapshot contains reviewed generic patches. The import-probe builder is available; complete pinned queue replay, browser build commands, browser runtime and application GPU acceptance are pending. It is not a browser release. Generic probes and launch tooling live here; platform-specific JIT hooks and target control stay with their platform owner. Dependency preparation must follow the pinned upstream sources; exploratory fetch-and-guess scripts are not a supported build procedure. No complete build or runtime qualification is claimed by this repository’s initial commit.
 
 Run `python3 tools/verify-patches.py` to verify patch hashes and the declared patch inventory. Build and runtime evidence must retain source, SDK, binary and debugger identities separately.
 

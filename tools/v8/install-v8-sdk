@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+# The V8 SDK core's workbench/libs/v8 builds v8.library against:
+#   install-v8-sdk V8SRC V8OUT DEST
+# V8SRC is the V8 checkout (its include/), V8OUT the GN out directory that
+# built the monolith (obj/v8/libv8_monolith.a, and gen/include/v8-gn.h when
+# GN wrote one; V8's headers include it only if present), DEST
+# the SDK directory, by default a build tree's Developer/V8. DEST is
+# new-only: remove an obsolete SDK explicitly before selecting a new destination.
+set -eu
+[ $# -eq 3 ] || { echo "usage: install-v8-sdk V8SRC V8OUT DEST" >&2; exit 2; }
+SRC=$1 OUT=$2 DEST=$3
+[ -f "$SRC/include/v8.h" ] || { echo "install-v8-sdk: no $SRC/include/v8.h" >&2; exit 1; }
+[ -f "$OUT/obj/v8/libv8_monolith.a" ] || { echo "install-v8-sdk: no $OUT/obj/v8/libv8_monolith.a" >&2; exit 1; }
+[ ! -e "$DEST" ] || { echo "install-v8-sdk: destination exists: $DEST" >&2; exit 1; }
+mkdir "$DEST"
+mkdir "$DEST/include" "$DEST/lib"
+cp -R "$SRC/include/." "$DEST/include/"
+[ -d "$OUT/gen/include" ] && cp -R "$OUT/gen/include/." "$DEST/include/"
+cp "$OUT/obj/v8/libv8_monolith.a" "$DEST/lib/"
+shasum -a 256 "$DEST/lib/libv8_monolith.a"

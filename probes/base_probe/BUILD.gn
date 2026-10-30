@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+#
+# Copy this directory to //aros_root in the partial Chromium checkout (see the
+# web-engine runbook, "Build parts of Chromium").
+group("root") {
+  deps = [
+    ":base_probe",
+    "//base",
+  ]
+}
+
+executable("base_probe") {
+  sources = [ "base_probe.cc" ]
+  deps = [ "//base" ]
+}

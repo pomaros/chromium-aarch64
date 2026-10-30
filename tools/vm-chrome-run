@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+# One hermetic chrome run in the PomAROS VM: a fresh APFS clone of the chrome
+# disk master, the network up first, chrome started in the background.
+# Usage: vm-chrome-run RUNDIR PRODUCTDIR STARTSCRIPT LINGER [qemu-product-check args]
+# Requires CHROME_DISK, CHROME_MOUNT and NO_REQUESTERS as explicit input files.
+set -eu
+CHECKER=${QEMU_PRODUCT_CHECK:?select the matching generic production checker}
+[ "$#" -ge 4 ] || { echo "usage: vm-chrome-run RUNDIR PRODUCTDIR STARTSCRIPT LINGER [check args]" >&2; exit 2; }
+: "${CHROME_DISK:?set CHROME_DISK to the immutable master image}"
+: "${CHROME_MOUNT:?set CHROME_MOUNT to the guest mount definition}"
+: "${NO_REQUESTERS:?set NO_REQUESTERS to the matching guest helper}"
+RUN=$1; V=$2; START=$3; LINGER=$4; shift 4
+[ ! -e "$RUN" ] && [ ! -e "$RUN.disk.img" ] || { echo "run output already exists" >&2; exit 2; }
+for input in "$CHECKER" "$CHROME_DISK" "$CHROME_MOUNT" "$NO_REQUESTERS" "$START" "$V/System.img" "$V/edk2-aarch64-code.fd"; do
+    [ -f "$input" ] || { echo "missing input: $input" >&2; exit 2; }
+done
+mkdir -p "$(dirname "$RUN")"
+cp -c "$CHROME_DISK" "$RUN.disk.img"
+check_exit=0
+python3 "$CHECKER" "$RUN" --image "$V/System.img" --firmware "$V/edk2-aarch64-code.fd" \
+  --memory 4096 --disk "$RUN.disk.img" --file "chrome.mount=$CHROME_MOUNT" --file "StartChrome=$START" \
+  --file "NoRequesters=$NO_REQUESTERS" \
+  --run "Mount CHROME0: FROM VMWORK0:chrome.mount" \
+  --run "Wait 2" --run "Assign LIBS: CHROME0:chromium ADD" --run "VMWORK0:NoRequesters" \
+  --run "Run Execute VMWORK0:StartChrome" --linger "$LINGER" --continue-after-fault --screenshot "$@" || check_exit=$?
+mtype -i "$RUN.disk.img" ::/chromium/chrome-yt.log > "$RUN/chrome.log" 2>/dev/null || true
+
+exit "$check_exit"

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+target_os = "aros"
+target_cpu = "arm64"
+is_debug = false
+is_component_build = false
+is_official_build = false
+treat_warnings_as_errors = false
+use_custom_libcxx = false
+use_sysroot = false
+use_lld = false
+use_gold = false
+is_cfi = false
+use_thin_lto = false
+clang_use_chrome_plugins = false
+clang_base_path = "<aros-crosstools>"
+aros_clang_root = "<aros-crosstools>/bin"
+aros_sysroot = "<configured AROS Developer SDK>"
+aros_tool_dir = "<configured AROS host tools>"
+v8_monolithic = true
+v8_static_library = true
+v8_use_external_startup_data = false
+v8_enable_i18n_support = false
+v8_enable_pointer_compression = false
+v8_enable_sandbox = false
+v8_enable_webassembly = true
