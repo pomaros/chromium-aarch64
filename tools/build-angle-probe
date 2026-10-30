@@ -1,0 +1,65 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+# Build ANGLEProbe: the probe objects, every ANGLE object GN lists for an
+# executable on libEGL_static and libGLESv2_static (out/aros-arm64/angle_probe.rsp),
+# the AROS relocatable pre-link and link, debug information stripped.
+#
+#   tools/build-angle-probe OUT-DIR
+#
+# Select ANGLE source (ANGLE=), its matching GN output (ANGLE_OUT=) and
+# the configured SDK (SDK=), host tools (TOOLS=) and compiler directory (CT=) explicitly.
+# The resolver must reach egl.library by its vectors:
+# an egl* symbol left in angle_native_egl.o would bind to ANGLE's own exports.
+set -eu
+[ "$#" -eq 1 ] || { echo "usage: build-angle-probe OUT-DIR" >&2; exit 2; }
+O=$1
+[ ! -e "$O" ] || { echo "build-angle-probe result=FAIL reason=output-exists" >&2; exit 2; }
+G=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CT=${CT:?select the AROS compiler directory}
+SDK=${SDK:?select the matching configured AROS Developer SDK}
+TOOLS=${TOOLS:?select the matching configured host tools directory}
+ANGLE=${ANGLE:?select the prepared ANGLE source checkout}
+ANGLE_OUT=${ANGLE_OUT:?select its matching GN output directory}
+P=$G/../probes
+for input in "$ANGLE_OUT/angle_probe.rsp" "$ANGLE_OUT/args.gn" "$ANGLE/include/EGL/egl.h" "$SDK/lib/startup.o" "$TOOLS/collect-aros"; do
+    [ -f "$input" ] || { echo "build-angle-probe result=FAIL reason=missing-input path=$input" >&2; exit 1; }
+done
+for tool in clang clang++ ld.lld llvm-nm llvm-objcopy llvm-readelf; do
+    [ -x "$CT/$tool" ] || { echo "build-angle-probe result=FAIL reason=missing-tool path=$CT/$tool" >&2; exit 1; }
+done
+# Linking changes directory to GN's output; inputs retain their original meaning.
+CT=$(CDPATH= cd -- "$CT" && pwd)
+SDK=$(CDPATH= cd -- "$SDK" && pwd)
+TOOLS=$(CDPATH= cd -- "$TOOLS" && pwd)
+ANGLE=$(CDPATH= cd -- "$ANGLE" && pwd)
+ANGLE_OUT=$(CDPATH= cd -- "$ANGLE_OUT" && pwd)
+python3 - "$ANGLE_OUT/args.gn" "$SDK" <<'PYSDK'
+import json, re, sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+match = re.search(r'^aros_sysroot\s*=\s*("(?:[^"\\]|\\.)*")\s*$', text, re.M)
+if not match or Path(json.loads(match[1])).resolve() != Path(sys.argv[2]).resolve():
+    raise SystemExit('build-angle-probe result=FAIL reason=ANGLE-and-runtime-SDK-mismatch; regenerate ANGLE with the selected SDK')
+PYSDK
+mkdir -p "$O"
+O=$(CDPATH= cd -- "$O" && pwd)
+CC="$CT/clang --target=aarch64-unknown-aros -mcmodel=large -fno-pic -fno-pie --sysroot=$SDK -B$TOOLS -std=gnu11 -Wall -Wextra -Werror -O2"
+$CC -I"$ANGLE/include" -DEGL_NO_X11 -c "$P/angle_probe.c" -o "$O/angle_probe.o"
+$CC -c "$P/angle_native_egl.c" -o "$O/angle_native_egl.o"
+if "$CT/llvm-nm" -u "$O/angle_native_egl.o" | grep -q ' egl'; then
+    echo "build-angle-probe result=FAIL reason=angle_native_egl.o calls egl* by symbol"; exit 1
+fi
+cd "$ANGLE_OUT"
+OBJS=$(tr ' ' '\n' < angle_probe.rsp | grep '\.o$')
+LIBS=$(tr ' ' '\n' < angle_probe.rsp | grep '\.a$')
+"$CT/ld.lld" -r --force-group-allocation -T "$G/aros-relocatable.lds" "$O/angle_probe.o" "$O/angle_native_egl.o" \
+    $OBJS --start-group $LIBS --end-group -o "$O/prelink.o"
+"$CT/clang++" --target=aarch64-unknown-aros -mcmodel=large --sysroot="$SDK" -B"$TOOLS" -Wl,--force-group-allocation \
+    -Wl,-T,"$G/aros-relocatable.lds" "$O/prelink.o" -lpthread -ldebug -o "$O/ANGLEProbe.debug"
+"$CT/llvm-objcopy" --strip-debug --remove-section=.linker-options --remove-section=.deplibs \
+    --remove-section=.llvm_addrsig "$O/ANGLEProbe.debug" "$O/ANGLEProbe"
+rm -f "$O/prelink.o"
+GOT=$("$CT/llvm-readelf" -r "$O/ANGLEProbe" | grep -c GOT || true)
+[ "$GOT" -eq 0 ] || { echo "build-angle-probe result=FAIL reason=$GOT GOT relocations"; exit 1; }
+echo "build-angle-probe result=PASS probe=$O/ANGLEProbe sha256=$(shasum -a 256 "$O/ANGLEProbe" | cut -d' ' -f1)"

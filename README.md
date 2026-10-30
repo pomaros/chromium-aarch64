@@ -52,6 +52,24 @@ arguments only: dependency preparation, pinned patch replay, build, AROS-native
 Vulkan loader integration and runtime qualification are separate requirements.
 The template is not evidence that WebGPU or application GPU acceleration works.
 
+## ANGLE probe
+
+`tools/build-angle-probe OUTPUT` compiles the native EGL vector adapter and
+ANGLE exercise, links the exact objects named by ANGLE's `angle_probe.rsp`,
+and checks for recursive EGL symbol binding and unsupported GOT relocations.
+Select every build input explicitly:
+
+```sh
+SDK=/path/to/AROS/Developer TOOLS=/path/to/host/tools \
+CT=/path/to/aros-crosstools/bin ANGLE=/path/to/prepared/angle \
+ANGLE_OUT=/path/to/angle/out/aros-arm64 tools/build-angle-probe artifacts/angle-probe
+```
+
+OUTPUT must be new. ANGLE's `args.gn` must select the same SDK. The shared
+`tools/aros-relocatable.lds` coalesces executable and constant sections during
+both relocatable pre-link and final AROS link. Successful construction proves
+neither EGL runtime behavior nor browser GPU acceleration.
+
 ## Independent veneer verification
 
 `tools/check-veneers BEFORE AFTER` independently checks the AArch64 range-extension
