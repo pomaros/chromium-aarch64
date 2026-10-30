@@ -52,6 +52,21 @@ arguments only: dependency preparation, pinned patch replay, build, AROS-native
 Vulkan loader integration and runtime qualification are separate requirements.
 The template is not evidence that WebGPU or application GPU acceleration works.
 
+## Independent veneer verification
+
+`tools/check-veneers BEFORE AFTER` independently checks the AArch64 range-extension
+pass against its unmodified relocatable input. Link with
+`AROS_LINK_KEEP_UNVENEERED=1` to retain that input, then run:
+
+```sh
+python3 tools/check-veneers out/aros-arm64/chrome.unveneered out/aros-arm64/chrome
+```
+
+The checker requires inserted islands, verifies their branch-over instructions,
+checks symbol movement and resolves the original PC-relative code references.
+Exit 0 and `result=PASS` establish that comparison only; they do not establish
+loading or execution on AROS.
+
 ## Qualification and migration
 
 This initial snapshot contains reviewed generic patches. The import-probe builder is available; complete pinned queue replay, browser build commands, public VM test tooling migration, browser runtime and application GPU acceptance are pending. It is not a browser release. The build tooling is being extracted from its existing integration checkout; that checkout remains the consumer until the extraction is verified. No complete build or runtime qualification is claimed by this repository’s initial commit.
